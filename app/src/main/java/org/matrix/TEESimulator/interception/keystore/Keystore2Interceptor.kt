@@ -93,7 +93,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 val isBatchMode = code == LIST_ENTRIES_BATCHED_TRANSACTION
                 if (ListEntriesHandler.cacheParameters(txId, data, isBatchMode)) TransactionResult.Continue else TransactionResult.ContinueAndSkipPost
             }.getOrElse {
-                SystemLogger.error("[TX_ID: $txId] Failed to parse parameters for ${transactionNames[code]!!}", it)
+                SystemLogger.error("[TX_ID: $txId] Failed to parse parameters", it)
                 TransactionResult.ContinueAndSkipPost
             }
         } else if (code == GET_KEY_ENTRY_TRANSACTION || code == DELETE_KEY_TRANSACTION || code == UPDATE_SUBCOMPONENT_TRANSACTION) {
@@ -107,32 +107,36 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 data.enforceInterface(IKeystoreService.DESCRIPTOR)
                 val descriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return TransactionResult.ContinueAndSkipPost
 
-                // [核心修复点] 提取通用的 KEY_ID 解析逻辑，彻底封堵 Domain.KEY_ID 逃逸
-                val keyId = if (descriptor.alias != null) {
-                    KeyIdentifier(callingUid, descriptor.alias)
+                // [核心修复点 1：全局物理扫描缓存池，彻底拦截 Timing Probe 的 KEY_ID 逃逸]
+                var resolvedKeyId: KeyIdentifier? = null
+                if (descriptor.alias != null) {
+                    resolvedKeyId = KeyIdentifier(callingUid, descriptor.alias)
                 } else if (descriptor.domain == Domain.KEY_ID) {
-                    KeyMintSecurityLevelInterceptor.findGeneratedKeyByKeyId(callingUid, descriptor.nspace)?.let { info ->
-                        KeyMintSecurityLevelInterceptor.generatedKeys.entries.find { it.value.nspace == info.nspace && it.key.uid == callingUid }?.key
+                    for ((k, v) in KeyMintSecurityLevelInterceptor.generatedKeys) {
+                        if (v.nspace == descriptor.nspace && k.uid == callingUid) {
+                            resolvedKeyId = k
+                            break
+                        }
                     }
-                } else null
+                }
 
                 if (code == DELETE_KEY_TRANSACTION) {
-                    if (keyId != null) {
-                        val isSoftwareKey = KeyMintSecurityLevelInterceptor.generatedKeys.containsKey(keyId)
-                        KeyMintSecurityLevelInterceptor.cleanupKeyData(keyId)
+                    if (resolvedKeyId != null) {
+                        val isSoftwareKey = KeyMintSecurityLevelInterceptor.generatedKeys.containsKey(resolvedKeyId)
+                        KeyMintSecurityLevelInterceptor.cleanupKeyData(resolvedKeyId)
                         if (isSoftwareKey) {
-                            deletedSoftwareKeys.add(keyId)
+                            deletedSoftwareKeys.add(resolvedKeyId)
                             return InterceptorUtils.createSuccessReply(writeResultCode = false)
                         }
                     }
                     return TransactionResult.ContinueAndSkipPost
                 }
 
-                if (keyId == null) return TransactionResult.ContinueAndSkipPost
+                if (resolvedKeyId == null) return TransactionResult.ContinueAndSkipPost
 
-                val response = KeyMintSecurityLevelInterceptor.getGeneratedKeyResponse(keyId)
+                val response = KeyMintSecurityLevelInterceptor.getGeneratedKeyResponse(resolvedKeyId)
                 if (response == null) {
-                    if (deletedSoftwareKeys.remove(keyId)) return InterceptorUtils.createErrorReply(RESPONSE_KEY_NOT_FOUND)
+                    if (deletedSoftwareKeys.remove(resolvedKeyId)) return InterceptorUtils.createErrorReply(RESPONSE_KEY_NOT_FOUND)
                     return TransactionResult.Continue
                 }
 
@@ -170,13 +174,17 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             if (!ConfigurationManager.shouldPatch(callingUid)) return TransactionResult.SkipTransaction
 
             runCatching {
-                val keyId = if (keyDescriptor.alias != null) {
-                    KeyIdentifier(callingUid, keyDescriptor.alias)
+                var keyId: KeyIdentifier? = null
+                if (keyDescriptor.alias != null) {
+                    keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
                 } else if (keyDescriptor.domain == Domain.KEY_ID) {
-                    KeyMintSecurityLevelInterceptor.findGeneratedKeyByKeyId(callingUid, keyDescriptor.nspace)?.let { info ->
-                        KeyMintSecurityLevelInterceptor.generatedKeys.entries.find { it.value.nspace == info.nspace && it.key.uid == callingUid }?.key
+                    for ((k, v) in KeyMintSecurityLevelInterceptor.generatedKeys) {
+                        if (v.nspace == keyDescriptor.nspace && k.uid == callingUid) {
+                            keyId = k
+                            break
+                        }
                     }
-                } else null
+                }
                 
                 if (keyId == null) return TransactionResult.SkipTransaction
 
@@ -224,11 +232,19 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
     private fun handleUpdateSubcomponent(callingUid: Int, data: Parcel): TransactionResult {
         data.enforceInterface(IKeystoreService.DESCRIPTOR)
         val descriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return TransactionResult.ContinueAndSkipPost
-        val generatedKeyInfo = when (descriptor.domain) {
-            Domain.KEY_ID -> KeyMintSecurityLevelInterceptor.findGeneratedKeyByKeyId(callingUid, descriptor.nspace)
-            Domain.APP -> descriptor.alias?.let { KeyMintSecurityLevelInterceptor.generatedKeys[KeyIdentifier(callingUid, it)] }
-            else -> null
+        
+        var generatedKeyInfo: KeyMintSecurityLevelInterceptor.GeneratedKeyInfo? = null
+        if (descriptor.domain == Domain.KEY_ID) {
+            for ((k, v) in KeyMintSecurityLevelInterceptor.generatedKeys) {
+                if (v.nspace == descriptor.nspace && k.uid == callingUid) {
+                    generatedKeyInfo = v
+                    break
+                }
+            }
+        } else if (descriptor.domain == Domain.APP && descriptor.alias != null) {
+            generatedKeyInfo = KeyMintSecurityLevelInterceptor.generatedKeys[KeyIdentifier(callingUid, descriptor.alias!!)]
         }
+
         if (generatedKeyInfo == null) {
             descriptor.alias?.let { userUpdatedKeys.add(KeyIdentifier(callingUid, it)) }
             return TransactionResult.ContinueAndSkipPost
