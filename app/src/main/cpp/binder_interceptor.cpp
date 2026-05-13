@@ -12,6 +12,7 @@
 #include <map>
 #include <mutex>
 #include <shared_mutex>
+#include <queue>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -50,9 +51,8 @@ struct ThreadTransactionInfo {
         : transaction_id(id), transaction_code(code), target_binder(std::move(target)) {}
 };
 
-// [修复点] 彻底废弃易错的线程队列，改用 IPC Buffer 物理地址作为唯一凭证映射
-static std::mutex g_context_mutex;
-static std::map<uintptr_t, ThreadTransactionInfo> g_context_map;
+static std::mutex g_thread_context_mutex;
+static std::map<std::thread::id, std::queue<ThreadTransactionInfo>> g_thread_context_map;
 
 class BinderInterceptor : public BBinder {
     struct RegistrationEntry {
@@ -101,21 +101,20 @@ protected:
         ThreadTransactionInfo info;
         bool found_context = false;
 
-        // [修复点] 直接通过 Parcel 携带的底层 IPC 内存指针寻回上下文，免疫丢包干扰
-        uintptr_t buffer_addr = reinterpret_cast<uintptr_t>(data.data());
-
         {
-            std::lock_guard<std::mutex> lock(g_context_mutex);
-            auto it = g_context_map.find(buffer_addr);
-            if (it != g_context_map.end()) {
-                info = std::move(it->second);
-                g_context_map.erase(it);
+            std::lock_guard<std::mutex> lock(g_thread_context_mutex);
+            auto it = g_thread_context_map.find(std::this_thread::get_id());
+            if (it != g_thread_context_map.end() && !it->second.empty()) {
+                info = std::move(it->second.front());
+                it->second.pop();
+                if (it->second.empty()) {
+                    g_thread_context_map.erase(it);
+                }
                 found_context = true;
             }
         }
 
         if (!found_context) {
-            LOGW("BinderStub dropped orphaned transaction for buffer %p", (void*)buffer_addr);
             return UNKNOWN_TRANSACTION;
         }
 
@@ -134,6 +133,22 @@ protected:
         if (!interceptorManagedFlow) {
             status = real_target->transact(info.transaction_code, data, reply, flags);
         }
+
+        // [修复核心1：全局异常清洗器 (Global Exception Leak Sanitizer)]
+        // Android Java 层抛出未捕获异常时，会在 reply 的头部写入 -128 (EX_HAS_REPLY_HEADER) 
+        // 甚至是 -2 (BadParcelable) 等私有负数代码，这被探针捕捉为私有异常。
+        // 我们在此物理拦截：强制将泄露的 Java 异常清洗为原生 Keystore2 的 ServiceSpecificError。
+        if (reply && status == OK && reply->dataSize() >= 4) {
+            int32_t header = *reinterpret_cast<const int32_t*>(reply->data());
+            // -8 是 EX_SERVICE_SPECIFIC，是合法的底层报错。除此之外的负数全视为非法泄露！
+            if (header < 0 && header != -8 && header != -129 /* EX_TRANSACTION_FAILED */) {
+                LOGE("[Sanitizer] Blocked Java exception leak in TX_ID: %" PRIu64 " | header: %d", info.transaction_id, header);
+                reply->setDataSize(0);
+                reply->writeInt32(-8); // 改写为 EX_SERVICE_SPECIFIC
+                reply->writeInt32(-1000); // 注入 KM_ERROR_UNKNOWN_ERROR (-1000)
+            }
+        }
+
         return status;
     }
 };
@@ -173,22 +188,12 @@ void inspectAndRewriteTransaction(binder_transaction_data *txn_data) {
         uint64_t tx_id = ++g_transaction_id_counter;
         info.transaction_id = tx_id;
 
-        // 获取底层分配的 IPC 缓冲地址作为防错乱的 Key
-        uintptr_t buffer_addr = txn_data->data.ptr.buffer;
-
         txn_data->target.ptr = reinterpret_cast<uintptr_t>(g_stub_instance->getWeakRefs());
         txn_data->cookie = reinterpret_cast<uintptr_t>(g_stub_instance.get());
         txn_data->code = intercept::kBackdoorCode;
 
-        std::lock_guard<std::mutex> lock(g_context_mutex);
-        g_context_map[buffer_addr] = std::move(info);
-
-        // 防御性清理：如果存在因恶意 timing skip 丢弃的未消费废包记录，定期回收
-        if (g_context_map.size() > 50) {
-            auto it = g_context_map.begin();
-            std::advance(it, 25);
-            g_context_map.erase(g_context_map.begin(), it);
-        }
+        std::lock_guard<std::mutex> lock(g_thread_context_mutex);
+        g_thread_context_map[std::this_thread::get_id()].push(std::move(info));
     }
 }
 
@@ -216,7 +221,7 @@ void processBinderReadBuffer(const binder_write_read &bwr) {
         ptr += cmd_size;
     }
 }
-} 
+}
 
 int intercepted_ioctl(int fd, int request, ...) {
     va_list ap;
