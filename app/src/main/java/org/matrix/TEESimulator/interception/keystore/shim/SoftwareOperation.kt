@@ -9,7 +9,6 @@ import android.hardware.security.keymint.KeyPurpose
 import android.hardware.security.keymint.PaddingMode
 import android.hardware.security.keymint.Tag
 import android.os.ServiceSpecificException
-import android.os.Parcel
 import java.util.concurrent.locks.LockSupport
 import android.system.keystore2.IKeystoreOperation
 import android.system.keystore2.KeyParameters
@@ -139,7 +138,6 @@ class SoftwareOperation(private val txId: Long, keyPair: KeyPair?, secretKey: ja
 
     fun updateAad(aadInput: ByteArray?) {
         checkActive()
-        // [核心修复点] 即使探针故意传入 Empty Array，也必须先执行状态封锁，强制返回 INVALID_TAG (-76)
         if (isDataStarted) throw ServiceSpecificException(KeystoreErrorCodes.invalidTag)
         if (aadInput == null || aadInput.isEmpty()) return
         
@@ -216,20 +214,8 @@ internal object KeystoreErrorCodes {
 
 class SoftwareOperationBinder(private val operation: SoftwareOperation) : IKeystoreOperation.Stub() {
 
-    // [核心修复点] 将探针发送畸形包导致的崩溃，用标准的原生异常流伪装封包返回，绝不暴漏给外部
-    override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
-        try {
-            return super.onTransact(code, data, reply, flags)
-        } catch (e: Exception) {
-            SystemLogger.error("SoftwareOperationBinder: Probe malformed parcel intercepted", e)
-            if (reply != null) {
-                reply.setDataPosition(0)
-                reply.writeException(android.os.ServiceSpecificException(KeystoreErrorCodes.invalidArgument, e.message ?: "Malformed"))
-                return true
-            }
-            return false
-        }
-    }
+    // [核心修复点] 彻底移除不安全的 onTransact 重写包裹器。
+    // 让 AOSP 自带的 AIDL Stub 完全接管底层序列化，确保 probe 读到的是完美原生的异常布局！
 
     private inline fun <T> safeCall(block: () -> T): T {
         return try { block() } 
