@@ -35,10 +35,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
 
     private val transactionNames: Map<Int, String> by lazy {
         stubBinderClass.declaredFields
-            .filter { 
-                it.isAccessible = true
-                it.type == Int::class.java && it.name.startsWith("TRANSACTION_") 
-            }
+            .filter { it.isAccessible = true; it.type == Int::class.java && it.name.startsWith("TRANSACTION_") }
             .associate { field -> (field.get(null) as Int) to field.name.split("_")[1] }
     }
 
@@ -110,15 +107,16 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 data.enforceInterface(IKeystoreService.DESCRIPTOR)
                 val descriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return TransactionResult.ContinueAndSkipPost
 
-                if (code == DELETE_KEY_TRANSACTION) {
-                    val keyId = if (descriptor.alias != null) {
-                        KeyIdentifier(callingUid, descriptor.alias)
-                    } else if (descriptor.domain == Domain.KEY_ID) {
-                        KeyMintSecurityLevelInterceptor.findGeneratedKeyByKeyId(callingUid, descriptor.nspace)?.let { info ->
-                            KeyMintSecurityLevelInterceptor.generatedKeys.entries.find { it.value.nspace == info.nspace && it.key.uid == callingUid }?.key
-                        }
-                    } else null
+                // [核心修复点] 提取通用的 KEY_ID 解析逻辑，彻底封堵 Domain.KEY_ID 逃逸
+                val keyId = if (descriptor.alias != null) {
+                    KeyIdentifier(callingUid, descriptor.alias)
+                } else if (descriptor.domain == Domain.KEY_ID) {
+                    KeyMintSecurityLevelInterceptor.findGeneratedKeyByKeyId(callingUid, descriptor.nspace)?.let { info ->
+                        KeyMintSecurityLevelInterceptor.generatedKeys.entries.find { it.value.nspace == info.nspace && it.key.uid == callingUid }?.key
+                    }
+                } else null
 
+                if (code == DELETE_KEY_TRANSACTION) {
                     if (keyId != null) {
                         val isSoftwareKey = KeyMintSecurityLevelInterceptor.generatedKeys.containsKey(keyId)
                         KeyMintSecurityLevelInterceptor.cleanupKeyData(keyId)
@@ -130,8 +128,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                     return TransactionResult.ContinueAndSkipPost
                 }
 
-                if (descriptor.alias == null) return TransactionResult.ContinueAndSkipPost
-                val keyId = KeyIdentifier(callingUid, descriptor.alias)
+                if (keyId == null) return TransactionResult.ContinueAndSkipPost
 
                 val response = KeyMintSecurityLevelInterceptor.getGeneratedKeyResponse(keyId)
                 if (response == null) {
@@ -144,10 +141,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             } catch (e: android.os.ServiceSpecificException) {
                 InterceptorUtils.createErrorReply(e.errorCode)
             } catch (e: Exception) {
-                // [修复核心1：绝不拦截畸形探针]
-                // 放弃将畸形包转为 -1，而是将其直接放给原生 Keystore2。
-                // 真正的原生服务遇到畸形包会返回底层 BAD_VALUE (-22)，这样检测器就抓不到私有异常了！
-                SystemLogger.error("[TX_ID: $txId] Caught malformed parcel from probe, dropping interception", e)
+                SystemLogger.error("[TX_ID: $txId] Caught exception, dropping interception", e)
                 TransactionResult.ContinueAndSkipPost
             }
         } else {
@@ -176,8 +170,17 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             if (!ConfigurationManager.shouldPatch(callingUid)) return TransactionResult.SkipTransaction
 
             runCatching {
+                val keyId = if (keyDescriptor.alias != null) {
+                    KeyIdentifier(callingUid, keyDescriptor.alias)
+                } else if (keyDescriptor.domain == Domain.KEY_ID) {
+                    KeyMintSecurityLevelInterceptor.findGeneratedKeyByKeyId(callingUid, keyDescriptor.nspace)?.let { info ->
+                        KeyMintSecurityLevelInterceptor.generatedKeys.entries.find { it.value.nspace == info.nspace && it.key.uid == callingUid }?.key
+                    }
+                } else null
+                
+                if (keyId == null) return TransactionResult.SkipTransaction
+
                 val response = reply.readTypedObject(KeyEntryResponse.CREATOR)!!
-                val keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
 
                 if (userUpdatedKeys.remove(keyId)) return TransactionResult.SkipTransaction
 
