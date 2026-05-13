@@ -32,6 +32,8 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
     private val LIST_ENTRIES_TRANSACTION = InterceptorUtils.getTransactCode(stubBinderClass, "listEntries")
     private val LIST_ENTRIES_BATCHED_TRANSACTION = if (Build.VERSION.SDK_INT >= 34) InterceptorUtils.getTransactCode(stubBinderClass, "listEntriesBatched") else null
     private val GET_NUMBER_OF_ENTRIES_TRANSACTION = InterceptorUtils.getTransactCode(stubBinderClass, "getNumberOfEntries")
+    // [终极修复 1：新增对私有会话请求的动态监听]
+    private val GET_SECURITY_LEVEL_TRANSACTION = InterceptorUtils.getTransactCode(stubBinderClass, "getSecurityLevel")
 
     private val transactionNames: Map<Int, String> by lazy {
         stubBinderClass.declaredFields
@@ -43,6 +45,9 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
     private val deletedSoftwareKeys: MutableSet<KeyIdentifier> = ConcurrentHashMap.newKeySet()
     private val userUpdatedKeys = ConcurrentHashMap.newKeySet<KeyIdentifier>()
 
+    // 保存拦截器的后门句柄，用于动态挂载
+    private lateinit var interceptorBackdoor: IBinder
+
     override val serviceName = "android.system.keystore2.IKeystoreService/default"
     override val processName = "keystore2"
     override val injectionCommand = "exec ./inject `pidof keystore2` libTEESimulator.so entry"
@@ -50,11 +55,13 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
     override val interceptedCodes: IntArray by lazy {
         listOfNotNull(
             GET_KEY_ENTRY_TRANSACTION, DELETE_KEY_TRANSACTION, UPDATE_SUBCOMPONENT_TRANSACTION,
-            LIST_ENTRIES_TRANSACTION, LIST_ENTRIES_BATCHED_TRANSACTION, GET_NUMBER_OF_ENTRIES_TRANSACTION
+            LIST_ENTRIES_TRANSACTION, LIST_ENTRIES_BATCHED_TRANSACTION, GET_NUMBER_OF_ENTRIES_TRANSACTION,
+            GET_SECURITY_LEVEL_TRANSACTION // 加入监听阵列
         ).toIntArray()
     }
 
     override fun onInterceptorReady(service: IBinder, backdoor: IBinder) {
+        interceptorBackdoor = backdoor
         val keystoreInterface = IKeystoreService.Stub.asInterface(service)
         setupSecurityLevelInterceptors(keystoreInterface, backdoor)
     }
@@ -80,7 +87,10 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
     override fun onPreTransact(
         txId: Long, target: IBinder, code: Int, flags: Int, callingUid: Int, callingPid: Int, data: Parcel
     ): TransactionResult {
-        if (code == GET_NUMBER_OF_ENTRIES_TRANSACTION) {
+        // [终极修复 2：放行请求，让内核生成新会话]
+        if (code == GET_SECURITY_LEVEL_TRANSACTION) {
+            return TransactionResult.Continue
+        } else if (code == GET_NUMBER_OF_ENTRIES_TRANSACTION) {
             return if (ConfigurationManager.shouldSkipUid(callingUid)) TransactionResult.ContinueAndSkipPost else TransactionResult.Continue
         } else if (code == LIST_ENTRIES_TRANSACTION || code == LIST_ENTRIES_BATCHED_TRANSACTION) {
             val packages = ConfigurationManager.getPackagesForUid(callingUid).joinToString()
@@ -132,8 +142,6 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
 
                 InterceptorUtils.createTypedObjectReply(response)
 
-            } catch (e: android.os.ServiceSpecificException) {
-                InterceptorUtils.createErrorReply(e.errorCode)
             } catch (e: Exception) {
                 TransactionResult.ContinueAndSkipPost
             }
@@ -146,7 +154,28 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
     ): TransactionResult {
         if (target != keystoreService || reply == null || InterceptorUtils.hasException(reply)) return TransactionResult.SkipTransaction
 
-        if (code == GET_NUMBER_OF_ENTRIES_TRANSACTION) {
+        // [终极修复 3：拦截返回结果，动态给新建立的私有会话套上项圈]
+        if (code == GET_SECURITY_LEVEL_TRANSACTION) {
+            return runCatching {
+                data.enforceInterface(IKeystoreService.DESCRIPTOR)
+                val requestedLevel = data.readInt()
+                
+                // 深拷贝一份回复数据以解析返回的 Binder，避免污染原包裹
+                val replyCopy = Parcel.obtain()
+                replyCopy.appendFrom(reply, 0, reply.dataSize())
+                replyCopy.setDataPosition(0)
+                replyCopy.readException()
+                val returnedBinder = replyCopy.readStrongBinder()
+                replyCopy.recycle()
+
+                if (returnedBinder != null) {
+                    SystemLogger.info("[TX_ID: $txId] Dynamically intercepting private SecurityLevel session for level $requestedLevel")
+                    val interceptor = KeyMintSecurityLevelInterceptor(returnedBinder, requestedLevel)
+                    register(interceptorBackdoor, returnedBinder, interceptor, KeyMintSecurityLevelInterceptor.INTERCEPTED_CODES)
+                }
+                TransactionResult.SkipTransaction
+            }.getOrElse { TransactionResult.SkipTransaction }
+        } else if (code == GET_NUMBER_OF_ENTRIES_TRANSACTION) {
             return runCatching {
                 val totalCount = reply.readInt() + KeyMintSecurityLevelInterceptor.generatedKeys.keys.count { it.uid == callingUid }
                 TransactionResult.OverrideReply(Parcel.obtain().apply { writeNoException(); writeInt(totalCount) })
@@ -156,11 +185,11 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 InterceptorUtils.createTypedArrayReply(ListEntriesHandler.injectGeneratedKeys(txId, callingUid, reply))
             }.getOrElse { TransactionResult.SkipTransaction }
         } else if (code == GET_KEY_ENTRY_TRANSACTION) {
-            data.enforceInterface(IKeystoreService.DESCRIPTOR)
-            val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return TransactionResult.SkipTransaction
-            if (!ConfigurationManager.shouldPatch(callingUid)) return TransactionResult.SkipTransaction
+            try {
+                data.enforceInterface(IKeystoreService.DESCRIPTOR)
+                val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return TransactionResult.SkipTransaction
+                if (!ConfigurationManager.shouldPatch(callingUid)) return TransactionResult.SkipTransaction
 
-            runCatching {
                 var keyId: KeyIdentifier? = null
                 if (keyDescriptor.domain == Domain.KEY_ID) {
                     for ((k, v) in KeyMintSecurityLevelInterceptor.generatedKeys) {
@@ -175,7 +204,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 
                 if (keyId == null) return TransactionResult.SkipTransaction
 
-                val response = reply.readTypedObject(KeyEntryResponse.CREATOR)!!
+                val response = reply.readTypedObject(KeyEntryResponse.CREATOR) ?: return TransactionResult.SkipTransaction
 
                 if (userUpdatedKeys.remove(keyId)) return TransactionResult.SkipTransaction
 
@@ -191,7 +220,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 if (KeyMintSecurityLevelInterceptor.importedKeys.contains(keyId)) return TransactionResult.SkipTransaction
 
                 if (parsedParameters.isAttestKey()) {
-                    val keyData = CertificateGenerator.generateAttestedKeyPair(callingUid, keyId.alias, null, parsedParameters, response.metadata.keySecurityLevel) ?: throw Exception("Failed")
+                    val keyData = CertificateGenerator.generateAttestedKeyPair(callingUid, keyId.alias, null, parsedParameters, response.metadata.keySecurityLevel) ?: return TransactionResult.SkipTransaction
                     CertificateHelper.updateCertificateChain(response.metadata, keyData.second.toTypedArray()).getOrThrow()
                     response.metadata.authorizations = InterceptorUtils.patchAuthorizations(response.metadata.authorizations, callingUid)
                     val newNspace = SecureRandom().nextLong()
@@ -211,34 +240,40 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 CertificateHelper.updateCertificateChain(response.metadata, finalChain).getOrThrow()
                 response.metadata.authorizations = InterceptorUtils.patchAuthorizations(response.metadata.authorizations, callingUid)
                 return InterceptorUtils.createTypedObjectReply(response)
-            }.onFailure { return TransactionResult.SkipTransaction }
+            } catch (e: Exception) {
+                return TransactionResult.SkipTransaction
+            }
         }
         return TransactionResult.SkipTransaction
     }
 
     private fun handleUpdateSubcomponent(callingUid: Int, data: Parcel): TransactionResult {
-        data.enforceInterface(IKeystoreService.DESCRIPTOR)
-        val descriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return TransactionResult.ContinueAndSkipPost
-        
-        var generatedKeyInfo: KeyMintSecurityLevelInterceptor.GeneratedKeyInfo? = null
-        if (descriptor.domain == Domain.KEY_ID) {
-            for ((k, v) in KeyMintSecurityLevelInterceptor.generatedKeys) {
-                if (v.nspace == descriptor.nspace && k.uid == callingUid) {
-                    generatedKeyInfo = v
-                    break
+        try {
+            data.enforceInterface(IKeystoreService.DESCRIPTOR)
+            val descriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return TransactionResult.ContinueAndSkipPost
+            
+            var generatedKeyInfo: KeyMintSecurityLevelInterceptor.GeneratedKeyInfo? = null
+            if (descriptor.domain == Domain.KEY_ID) {
+                for ((k, v) in KeyMintSecurityLevelInterceptor.generatedKeys) {
+                    if (v.nspace == descriptor.nspace && k.uid == callingUid) {
+                        generatedKeyInfo = v
+                        break
+                    }
                 }
+            } else if (descriptor.domain == Domain.APP && descriptor.alias != null) {
+                generatedKeyInfo = KeyMintSecurityLevelInterceptor.generatedKeys[KeyIdentifier(callingUid, descriptor.alias!!)]
             }
-        } else if (descriptor.domain == Domain.APP && descriptor.alias != null) {
-            generatedKeyInfo = KeyMintSecurityLevelInterceptor.generatedKeys[KeyIdentifier(callingUid, descriptor.alias!!)]
-        }
 
-        if (generatedKeyInfo == null) {
-            descriptor.alias?.let { userUpdatedKeys.add(KeyIdentifier(callingUid, it)) }
+            if (generatedKeyInfo == null) {
+                descriptor.alias?.let { userUpdatedKeys.add(KeyIdentifier(callingUid, it)) }
+                return TransactionResult.ContinueAndSkipPost
+            }
+            generatedKeyInfo.response.metadata.certificate = data.createByteArray()
+            generatedKeyInfo.response.metadata.certificateChain = data.createByteArray()
+            GeneratedKeyPersistence.rePersistIfNeeded(callingUid, generatedKeyInfo)
+            return InterceptorUtils.createSuccessReply(writeResultCode = false)
+        } catch (e: Exception) {
             return TransactionResult.ContinueAndSkipPost
         }
-        generatedKeyInfo.response.metadata.certificate = data.createByteArray()
-        generatedKeyInfo.response.metadata.certificateChain = data.createByteArray()
-        GeneratedKeyPersistence.rePersistIfNeeded(callingUid, generatedKeyInfo)
-        return InterceptorUtils.createSuccessReply(writeResultCode = false)
     }
 }
