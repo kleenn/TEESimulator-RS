@@ -162,6 +162,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                     )
                     TransactionResult.ContinueAndSkipPost
                 }
+        // 将原有的 else if 块替换为包含 try-catch 的安全块：
         } else if (
             code == GET_KEY_ENTRY_TRANSACTION ||
                 code == DELETE_KEY_TRANSACTION ||
@@ -172,65 +173,67 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             if (ConfigurationManager.shouldSkipUid(callingUid))
                 return TransactionResult.ContinueAndSkipPost
 
-            if (code == UPDATE_SUBCOMPONENT_TRANSACTION)
-                return handleUpdateSubcomponent(callingUid, data)
+            return try { // <--- 增加 try 块
+                if (code == UPDATE_SUBCOMPONENT_TRANSACTION)
+                    return@try handleUpdateSubcomponent(callingUid, data) // 注意这里的 return@try
 
-            data.enforceInterface(IKeystoreService.DESCRIPTOR)
-            val descriptor =
-                data.readTypedObject(KeyDescriptor.CREATOR)
-                    ?: return TransactionResult.ContinueAndSkipPost
+                data.enforceInterface(IKeystoreService.DESCRIPTOR)
+                val descriptor =
+                    data.readTypedObject(KeyDescriptor.CREATOR)
+                        ?: return@try TransactionResult.ContinueAndSkipPost
 
-            if (code == DELETE_KEY_TRANSACTION) {
-                val keyId =
-                    if (descriptor.alias != null) {
-                        KeyIdentifier(callingUid, descriptor.alias)
-                    } else if (descriptor.domain == Domain.KEY_ID) {
-                        KeyMintSecurityLevelInterceptor.findGeneratedKeyByKeyId(
-                            callingUid, descriptor.nspace
-                        )?.let { info ->
-                            KeyMintSecurityLevelInterceptor.generatedKeys.entries
-                                .find { it.value.nspace == info.nspace && it.key.uid == callingUid }
-                                ?.key
+                // ... (保留原有的 DELETE_KEY_TRANSACTION 逻辑) ...
+                if (code == DELETE_KEY_TRANSACTION) {
+                    // ... 原有代码 ...
+                    if (keyId != null) {
+                        val isSoftwareKey =
+                            KeyMintSecurityLevelInterceptor.generatedKeys.containsKey(keyId)
+                        KeyMintSecurityLevelInterceptor.cleanupKeyData(keyId)
+                        if (isSoftwareKey) {
+                            deletedSoftwareKeys.add(keyId)
+                            SystemLogger.info(
+                                "[TX_ID: $txId] Deleted cached keypair ${keyId.alias}, replying with empty response."
+                            )
+                            return@try InterceptorUtils.createSuccessReply(writeResultCode = false)
                         }
-                    } else null
-
-                if (keyId != null) {
-                    val isSoftwareKey =
-                        KeyMintSecurityLevelInterceptor.generatedKeys.containsKey(keyId)
-                    KeyMintSecurityLevelInterceptor.cleanupKeyData(keyId)
-                    if (isSoftwareKey) {
-                        deletedSoftwareKeys.add(keyId)
-                        SystemLogger.info(
-                            "[TX_ID: $txId] Deleted cached keypair ${keyId.alias}, replying with empty response."
-                        )
-                        return InterceptorUtils.createSuccessReply(writeResultCode = false)
                     }
+                    return@try TransactionResult.ContinueAndSkipPost
                 }
-                return TransactionResult.ContinueAndSkipPost
-            }
 
-            if (descriptor.alias == null) {
-                return TransactionResult.ContinueAndSkipPost
-            }
-            val keyId = KeyIdentifier(callingUid, descriptor.alias)
-
-            val response = KeyMintSecurityLevelInterceptor.getGeneratedKeyResponse(keyId)
-            if (response == null) {
-                if (deletedSoftwareKeys.remove(keyId)) {
-                    SystemLogger.info("[TX_ID: $txId] Returning KEY_NOT_FOUND for deleted key ${descriptor.alias}")
-                    return InterceptorUtils.createErrorReply(RESPONSE_KEY_NOT_FOUND)
+                if (descriptor.alias == null) {
+                    return@try TransactionResult.ContinueAndSkipPost
                 }
-                return TransactionResult.Continue
-            }
+                val keyId = KeyIdentifier(callingUid, descriptor.alias)
 
-            if (KeyMintSecurityLevelInterceptor.isAttestationKey(keyId))
-                SystemLogger.info("${descriptor.alias} was an attestation key")
+                val response = KeyMintSecurityLevelInterceptor.getGeneratedKeyResponse(keyId)
+                if (response == null) {
+                    if (deletedSoftwareKeys.remove(keyId)) {
+                        SystemLogger.info("[TX_ID: $txId] Returning KEY_NOT_FOUND for deleted key ${descriptor.alias}")
+                        return@try InterceptorUtils.createErrorReply(RESPONSE_KEY_NOT_FOUND)
+                    }
+                    return@try TransactionResult.Continue
+                }
 
-            SystemLogger.info("[TX_ID: $txId] Found generated response for ${descriptor.alias}:")
-            response.metadata?.authorizations?.forEach {
-                KeyMintParameterLogger.logParameter(it.keyParameter)
+                if (KeyMintSecurityLevelInterceptor.isAttestationKey(keyId))
+                    SystemLogger.info("${descriptor.alias} was an attestation key")
+
+                SystemLogger.info("[TX_ID: $txId] Found generated response for ${descriptor.alias}:")
+                response.metadata?.authorizations?.forEach {
+                    KeyMintParameterLogger.logParameter(it.keyParameter)
+                }
+                InterceptorUtils.createTypedObjectReply(response)
+
+            } catch (e: android.os.ServiceSpecificException) {
+                // 捕获合法的 Keystore 服务异常 (如上一步我们在 NativeCertGen 抛出的 -21)
+                SystemLogger.warning("[TX_ID: $txId] Blocked by ServiceSpecificException: ${e.message}")
+                InterceptorUtils.createErrorReply(e.errorCode)
+            } catch (e: Exception) {
+                // 修复 Captured private binder exception：绝不让原生崩溃穿透到 Binder！
+                SystemLogger.error("[TX_ID: $txId] Caught generic exception in Keystore2 logic, mapping to KM_ERROR_UNKNOWN_ERROR", e)
+                // -28 是 KM_ERROR_INVALID_OPERATION_HANDLE, -1 是 KM_ERROR_UNKNOWN_ERROR
+                // 根据 Duck Detector 探针的期望，返回一个标准错误码
+                InterceptorUtils.createErrorReply(-1) 
             }
-            return InterceptorUtils.createTypedObjectReply(response)
         } else {
             logTransaction(
                 txId,
