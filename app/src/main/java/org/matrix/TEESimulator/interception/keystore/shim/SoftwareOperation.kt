@@ -9,6 +9,7 @@ import android.hardware.security.keymint.KeyPurpose
 import android.hardware.security.keymint.PaddingMode
 import android.hardware.security.keymint.Tag
 import android.os.ServiceSpecificException
+import android.os.Parcel
 import java.util.concurrent.locks.LockSupport
 import android.system.keystore2.IKeystoreOperation
 import android.system.keystore2.KeyParameters
@@ -139,8 +140,10 @@ class SoftwareOperation(private val txId: Long, keyPair: KeyPair?, secretKey: ja
     fun updateAad(aadInput: ByteArray?) {
         checkActive()
         if (isDataStarted) throw ServiceSpecificException(KeystoreErrorCodes.invalidTag)
-        if (aadInput == null || aadInput.isEmpty()) return
         
+        // [核心修复点 2：取消所有非空判断短路]
+        // 原生硬件对 ECDSA 的 updateAad 操作，无论传入什么（哪怕是空数组），都会被底层密码库无条件拒绝。
+        // 此前代码提前 return 导致了 mismatch。现在让它流入 primitive，触发期待的 INVALID_TAG 报错！
         checkInputLength(aadInput)
         try {
             primitive.updateAad(aadInput)
@@ -213,9 +216,6 @@ internal object KeystoreErrorCodes {
 }
 
 class SoftwareOperationBinder(private val operation: SoftwareOperation) : IKeystoreOperation.Stub() {
-
-    // [核心修复点] 彻底移除不安全的 onTransact 重写包裹器。
-    // 让 AOSP 自带的 AIDL Stub 完全接管底层序列化，确保 probe 读到的是完美原生的异常布局！
 
     private inline fun <T> safeCall(block: () -> T): T {
         return try { block() } 
