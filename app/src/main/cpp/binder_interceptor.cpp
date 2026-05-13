@@ -11,6 +11,7 @@
 #include <cinttypes>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <string_view>
 #include <thread>
 #include <utility>
