@@ -73,18 +73,8 @@ object NativeCertGen {
         }
     }
 
-    external fun generateAttestedKeyPair(config: CertGenConfig): ByteArray?
-
-    private external fun initLogging(verbose: Boolean, logDir: String): Boolean
-
-    private external fun dumpLogs(): String?
-
-    fun dump(): String? = if (isAvailable) dumpLogs() else null
-
-    // 在 parseNativeResult 方法前添加一个配置校验方法
+    // [修复点] 拦截超大负载攻击 (Oversized challenge)
     fun validateConfigOrThrow(config: CertGenConfig) {
-        // 修复 Oversized challenge (Duck Detector 发送的 256B/512B/4096B 探针)
-        // Keymaster 规范限制 attestation challenge 最大为 128 bytes
         val challengeLen = config.attestationChallenge?.size ?: 0
         if (challengeLen > 128) {
             SystemLogger.error("NativeCertGen: Rejected oversized challenge of size $challengeLen")
@@ -92,6 +82,14 @@ object NativeCertGen {
             throw android.os.ServiceSpecificException(-21, "Invalid challenge length")
         }
     }
+
+    external fun generateAttestedKeyPair(config: CertGenConfig): ByteArray?
+
+    private external fun initLogging(verbose: Boolean, logDir: String): Boolean
+
+    private external fun dumpLogs(): String?
+
+    fun dump(): String? = if (isAvailable) dumpLogs() else null
 
     fun parseNativeResult(bytes: ByteArray): Pair<KeyPair, List<Certificate>> {
         val buf = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
