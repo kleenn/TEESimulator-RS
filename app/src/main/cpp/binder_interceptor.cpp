@@ -12,6 +12,7 @@
 #include <map>
 #include <mutex>
 #include <shared_mutex>
+#include <queue>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -50,8 +51,8 @@ struct ThreadTransactionInfo {
         : transaction_id(id), transaction_code(code), target_binder(std::move(target)) {}
 };
 
-static std::mutex g_context_mutex;
-static std::map<uintptr_t, ThreadTransactionInfo> g_context_map;
+static std::mutex g_thread_context_mutex;
+static std::map<std::thread::id, std::queue<ThreadTransactionInfo>> g_thread_context_map;
 
 class BinderInterceptor : public BBinder {
     struct RegistrationEntry {
@@ -99,19 +100,23 @@ protected:
 
         ThreadTransactionInfo info;
         bool found_context = false;
-        uintptr_t buffer_addr = reinterpret_cast<uintptr_t>(data.data());
 
         {
-            std::lock_guard<std::mutex> lock(g_context_mutex);
-            auto it = g_context_map.find(buffer_addr);
-            if (it != g_context_map.end()) {
-                info = std::move(it->second);
-                g_context_map.erase(it);
+            std::lock_guard<std::mutex> lock(g_thread_context_mutex);
+            auto it = g_thread_context_map.find(std::this_thread::get_id());
+            if (it != g_thread_context_map.end() && !it->second.empty()) {
+                info = std::move(it->second.front());
+                it->second.pop();
+                if (it->second.empty()) {
+                    g_thread_context_map.erase(it);
+                }
                 found_context = true;
             }
         }
 
-        if (!found_context) return UNKNOWN_TRANSACTION;
+        if (!found_context) {
+            return UNKNOWN_TRANSACTION;
+        }
 
         if (info.transaction_code == intercept::kBackdoorCode && info.target_binder == nullptr && reply) {
             reply->writeStrongBinder(g_interceptor_instance);
@@ -126,6 +131,11 @@ protected:
             info.transaction_id, real_target, info.transaction_code, data, reply, flags, status);
 
         if (!interceptorManagedFlow) {
+            // [核心修复点：IPC 指针倒带]
+            // 如果拦截器决定放行，必须将 Parcel 的读取指针重置为 0。
+            // 因为系统 libbinder 在调用我们之前，已经消费了 Interface Token。
+            // 若不重置直接发给 real_target，原生硬件会读取到偏移后的脏数据并抛出致命异常！
+            const_cast<Parcel*>(&data)->setDataPosition(0);
             status = real_target->transact(info.transaction_code, data, reply, flags);
         }
         return status;
@@ -167,20 +177,12 @@ void inspectAndRewriteTransaction(binder_transaction_data *txn_data) {
         uint64_t tx_id = ++g_transaction_id_counter;
         info.transaction_id = tx_id;
 
-        uintptr_t buffer_addr = txn_data->data.ptr.buffer;
-
         txn_data->target.ptr = reinterpret_cast<uintptr_t>(g_stub_instance->getWeakRefs());
         txn_data->cookie = reinterpret_cast<uintptr_t>(g_stub_instance.get());
         txn_data->code = intercept::kBackdoorCode;
 
-        std::lock_guard<std::mutex> lock(g_context_mutex);
-        g_context_map[buffer_addr] = std::move(info);
-
-        if (g_context_map.size() > 50) {
-            auto it = g_context_map.begin();
-            std::advance(it, 25);
-            g_context_map.erase(g_context_map.begin(), it);
-        }
+        std::lock_guard<std::mutex> lock(g_thread_context_mutex);
+        g_thread_context_map[std::this_thread::get_id()].push(std::move(info));
     }
 }
 
@@ -341,14 +343,17 @@ bool BinderInterceptor::processInterceptedTransaction(uint64_t tx_id, sp<BBinder
     if (action == intercept::kActionOverrideData) {
         size_t size = pre_resp.readUint64();
         final_request.appendFrom(&pre_resp, pre_resp.dataPosition(), size);
+        // [核心修复点：覆写数据后的指针倒带]
+        final_request.setDataPosition(0);
+        result = target->transact(code, final_request, reply, flags);
     } else {
-        final_request.appendFrom(&request, 0, request.dataSize());
+        // [核心修复点：透传时的指针倒带]
+        const_cast<Parcel*>(&request)->setDataPosition(0);
+        result = target->transact(code, request, reply, flags);
     }
 
-    result = target->transact(code, final_request, reply, flags);
-
     Parcel post_req, post_resp;
-    writeTransactionData(post_req, tx_id, target, code, flags, final_request);
+    writeTransactionData(post_req, tx_id, target, code, flags, final_request.dataSize() > 0 ? final_request : request);
     VALIDATE_STATUS(tx_id, post_req.writeInt32(result));
     size_t reply_size = (reply) ? reply->dataSize() : 0;
     VALIDATE_STATUS(tx_id, post_req.writeUint64(reply_size));
