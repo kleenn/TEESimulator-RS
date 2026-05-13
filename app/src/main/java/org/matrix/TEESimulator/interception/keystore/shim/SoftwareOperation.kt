@@ -326,6 +326,7 @@ class SoftwareOperation(
 }
 
 internal object KeystoreErrorCodes {
+    val tooMuchData: Int by lazy { resolveField("android.system.keystore2.ResponseCode", "TOO_MUCH_DATA", 21) }
     val invalidOperationHandle: Int by lazy { resolveField("android.hardware.security.keymint.ErrorCode", "INVALID_OPERATION_HANDLE", -28) }
     val invalidTag: Int by lazy { resolveField("android.hardware.security.keymint.ErrorCode", "INVALID_TAG", -76) }
     val verificationFailed: Int by lazy { resolveField("android.hardware.security.keymint.ErrorCode", "VERIFICATION_FAILED", -30) }
@@ -335,46 +336,16 @@ internal object KeystoreErrorCodes {
     val incompatiblePurpose: Int by lazy { resolveField("android.hardware.security.keymint.ErrorCode", "INCOMPATIBLE_PURPOSE", -13) }
     val unsupportedPurpose: Int by lazy { resolveField("android.hardware.security.keymint.ErrorCode", "UNSUPPORTED_PURPOSE", -14) }
     val incompatibleAlgorithm: Int by lazy { resolveField("android.hardware.security.keymint.ErrorCode", "INCOMPATIBLE_ALGORITHM", -18) }
+    
+    // [修复点] 补回被误删的常量，供 AuthorizeCreate.kt 调用
+    val keyNotYetValid: Int by lazy { resolveField("android.hardware.security.keymint.ErrorCode", "KEY_NOT_YET_VALID", -39) }
+    val keyExpired: Int by lazy { resolveField("android.hardware.security.keymint.ErrorCode", "KEY_EXPIRED", -40) }
+    val callerNonceProhibited: Int by lazy { resolveField("android.hardware.security.keymint.ErrorCode", "CALLER_NONCE_PROHIBITED", -55) }
+    
     val unknownError: Int by lazy { resolveField("android.hardware.security.keymint.ErrorCode", "UNKNOWN_ERROR", -1000) }
 
     fun resolveField(className: String, fieldName: String, fallback: Int): Int =
         runCatching {
             Class.forName(className).getField(fieldName).getInt(null)
         }.getOrElse { fallback }
-}
-
-class SoftwareOperationBinder(private val operation: SoftwareOperation) :
-    IKeystoreOperation.Stub() {
-
-    private inline fun <T> safeCall(block: () -> T): T {
-        return try {
-            block()
-        } catch (e: ServiceSpecificException) {
-            throw e
-        } catch (e: Exception) {
-            throw ServiceSpecificException(KeystoreErrorCodes.unknownError, e.message)
-        }
-    }
-
-    @Synchronized
-    override fun updateAad(aadInput: ByteArray?) {
-        safeCall { operation.updateAad(aadInput) }
-    }
-
-    @Synchronized
-    override fun update(input: ByteArray?): ByteArray? {
-        return safeCall { operation.update(input) }
-    }
-
-    @Synchronized
-    override fun finish(input: ByteArray?, signature: ByteArray?): ByteArray? {
-        return safeCall { operation.finish(input, signature) }
-    }
-
-    @Synchronized
-    override fun abort() {
-        try {
-            operation.abort()
-        } catch (ignored: Exception) {}
-    }
 }
