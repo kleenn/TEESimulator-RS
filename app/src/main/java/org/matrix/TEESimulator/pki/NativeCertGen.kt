@@ -81,6 +81,18 @@ object NativeCertGen {
 
     fun dump(): String? = if (isAvailable) dumpLogs() else null
 
+    // 在 parseNativeResult 方法前添加一个配置校验方法
+    fun validateConfigOrThrow(config: CertGenConfig) {
+        // 修复 Oversized challenge (Duck Detector 发送的 256B/512B/4096B 探针)
+        // Keymaster 规范限制 attestation challenge 最大为 128 bytes
+        val challengeLen = config.attestationChallenge?.size ?: 0
+        if (challengeLen > 128) {
+            SystemLogger.error("NativeCertGen: Rejected oversized challenge of size $challengeLen")
+            // -21 是 KM_ERROR_INVALID_INPUT_LENGTH
+            throw android.os.ServiceSpecificException(-21, "Invalid challenge length")
+        }
+    }
+
     fun parseNativeResult(bytes: ByteArray): Pair<KeyPair, List<Certificate>> {
         val buf = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
 
