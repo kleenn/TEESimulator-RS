@@ -204,6 +204,9 @@ class SoftwareOperation(
     @Volatile var finalized = false
         private set
 
+    // [修复点] 记录是否已经开始处理数据内容
+    private var isDataStarted = false
+
     var onFinishCallback: (() -> Unit)? = null
 
     val beginParameters: KeyParameters?
@@ -256,13 +259,30 @@ class SoftwareOperation(
     fun updateAad(aadInput: ByteArray?) {
         SystemLogger.debug("[SoftwareOp TX_ID: $txId] updateAad() inputSize=${aadInput?.size ?: 0}")
         checkActive()
+        
+        // [修复点] 如果已经调用过 update，则必须返回 INVALID_TAG (-76)
+        if (isDataStarted) {
+            SystemLogger.warning("[SoftwareOp TX_ID: $txId] updateAad called after update, throwing INVALID_TAG")
+            throw ServiceSpecificException(KeystoreErrorCodes.invalidTag)
+        }
+        
         checkInputLength(aadInput)
-        primitive.updateAad(aadInput)
+        try {
+            primitive.updateAad(aadInput)
+        } catch (e: ServiceSpecificException) {
+            throw e
+        } catch (e: Exception) {
+            throw mapToServiceSpecificException(e)
+        }
     }
 
     fun update(data: ByteArray?): ByteArray? {
         SystemLogger.debug("[SoftwareOp TX_ID: $txId] update() inputSize=${data?.size ?: 0}")
         checkActive()
+        
+        // [修复点] 标记已进入数据阶段，后续不再接受 AAD
+        isDataStarted = true
+        
         checkInputLength(data)
         try {
             return primitive.update(data)
@@ -303,11 +323,14 @@ class SoftwareOperation(
         SystemLogger.debug("[SoftwareOp TX_ID: $txId] Operation aborted.")
     }
 
+    // [修复点] 增强错误映射，处理 JCA 的状态异常
     private fun mapToServiceSpecificException(e: Exception): ServiceSpecificException = when (e) {
         is SignatureException -> ServiceSpecificException(KeystoreErrorCodes.verificationFailed, e.message)
         is javax.crypto.BadPaddingException -> ServiceSpecificException(KeystoreErrorCodes.invalidArgument, e.message)
         is javax.crypto.IllegalBlockSizeException -> ServiceSpecificException(KeystoreErrorCodes.invalidInputLength, e.message)
         is java.security.InvalidKeyException -> ServiceSpecificException(KeystoreErrorCodes.incompatibleKey, e.message)
+        // [修复点] 将 JCA 的状态异常映射为 Keystore 的语义错误
+        is IllegalStateException -> ServiceSpecificException(KeystoreErrorCodes.invalidTag, "Operation in wrong state: ${e.message}")
         else -> ServiceSpecificException(KeystoreErrorCodes.unknownError, e.message)
     }
 
@@ -385,23 +408,36 @@ internal object KeystoreErrorCodes {
 class SoftwareOperationBinder(private val operation: SoftwareOperation) :
     IKeystoreOperation.Stub() {
 
+    // [修复点] 统一的异常捕获执行块，防止任何底层异常穿透到 Binder 驱动
+    private inline fun <T> safeCall(block: () -> T): T {
+        return try {
+            block()
+        } catch (e: ServiceSpecificException) {
+            throw e
+        } catch (e: Exception) {
+            throw ServiceSpecificException(KeystoreErrorCodes.unknownError, e.message)
+        }
+    }
+
     @Synchronized
     override fun updateAad(aadInput: ByteArray?) {
-        operation.updateAad(aadInput)
+        safeCall { operation.updateAad(aadInput) }
     }
 
     @Synchronized
     override fun update(input: ByteArray?): ByteArray? {
-        return operation.update(input)
+        return safeCall { operation.update(input) }
     }
 
     @Synchronized
     override fun finish(input: ByteArray?, signature: ByteArray?): ByteArray? {
-        return operation.finish(input, signature)
+        return safeCall { operation.finish(input, signature) }
     }
 
     @Synchronized
     override fun abort() {
-        operation.abort()
+        try {
+            operation.abort()
+        } catch (ignored: Exception) {}
     }
 }
