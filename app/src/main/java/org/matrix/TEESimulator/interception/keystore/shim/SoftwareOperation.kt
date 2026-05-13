@@ -349,3 +349,39 @@ internal object KeystoreErrorCodes {
             Class.forName(className).getField(fieldName).getInt(null)
         }.getOrElse { fallback }
 }
+
+class SoftwareOperationBinder(private val operation: SoftwareOperation) :
+    IKeystoreOperation.Stub() {
+
+    private inline fun <T> safeCall(block: () -> T): T {
+        return try {
+            block()
+        } catch (e: ServiceSpecificException) {
+            throw e
+        } catch (e: Exception) {
+            throw ServiceSpecificException(KeystoreErrorCodes.unknownError, e.message)
+        }
+    }
+
+    @Synchronized
+    override fun updateAad(aadInput: ByteArray?) {
+        safeCall { operation.updateAad(aadInput) }
+    }
+
+    @Synchronized
+    override fun update(input: ByteArray?): ByteArray? {
+        return safeCall { operation.update(input) }
+    }
+
+    @Synchronized
+    override fun finish(input: ByteArray?, signature: ByteArray?): ByteArray? {
+        return safeCall { operation.finish(input, signature) }
+    }
+
+    @Synchronized
+    override fun abort() {
+        try {
+            operation.abort()
+        } catch (ignored: Exception) {}
+    }
+}
