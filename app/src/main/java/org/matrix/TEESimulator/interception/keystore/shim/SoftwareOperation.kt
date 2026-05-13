@@ -138,7 +138,6 @@ class SoftwareOperation(private val txId: Long, keyPair: KeyPair?, secretKey: ja
     }
 
     fun updateAad(aadInput: ByteArray?) {
-        // [修复核心2：完美复现 AOSP 对空数组的无条件放行逻辑]
         if (aadInput == null || aadInput.isEmpty()) return
 
         checkActive()
@@ -217,21 +216,17 @@ internal object KeystoreErrorCodes {
 
 class SoftwareOperationBinder(private val operation: SoftwareOperation) : IKeystoreOperation.Stub() {
 
-    // [修复核心3：坚不可摧的包裹器]
-    // 重写整个 onTransact，防止 Duck Detector 发送被破坏的数据流引发 BadParcelableException，
-    // 强制将任何序列化奔溃翻译为 Android AIDL 预期的标准异常协议。
+    // [修复核心2：释放合法的 ServiceSpecificException，满足探针的断言期望]
     override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
         try {
             return super.onTransact(code, data, reply, flags)
+        } catch (e: android.os.ServiceSpecificException) {
+            // 这是被探针允许且期待的底层报错（如 INVALID_TAG -76）
+            // 抛出后让 Android 自动转换为 EX_SERVICE_SPECIFIC，不会判定为私有异常
+            throw e
         } catch (e: Exception) {
             SystemLogger.error("SoftwareOperationBinder: Probe malformed parcel intercepted", e)
-            if (reply != null) {
-                reply.setDataPosition(0)
-                // 原生解析失败时通常表现为参数错误
-                reply.writeException(android.os.ServiceSpecificException(KeystoreErrorCodes.invalidArgument, e.message))
-                return true
-            }
-            return false
+            throw android.os.ServiceSpecificException(KeystoreErrorCodes.invalidArgument, e.message)
         }
     }
 
