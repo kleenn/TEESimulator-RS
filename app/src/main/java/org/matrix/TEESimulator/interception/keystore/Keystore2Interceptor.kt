@@ -81,24 +81,15 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
         txId: Long, target: IBinder, code: Int, flags: Int, callingUid: Int, callingPid: Int, data: Parcel
     ): TransactionResult {
         if (code == GET_NUMBER_OF_ENTRIES_TRANSACTION) {
-            logTransaction(txId, transactionNames[code]!!, callingUid, callingPid, true)
             return if (ConfigurationManager.shouldSkipUid(callingUid)) TransactionResult.ContinueAndSkipPost else TransactionResult.Continue
         } else if (code == LIST_ENTRIES_TRANSACTION || code == LIST_ENTRIES_BATCHED_TRANSACTION) {
-            logTransaction(txId, transactionNames[code]!!, callingUid, callingPid, true)
             val packages = ConfigurationManager.getPackagesForUid(callingUid).joinToString()
-            if (packages.contains("com.google.android.gms") || ConfigurationManager.shouldSkipUid(callingUid)) {
-                return TransactionResult.ContinueAndSkipPost
-            }
+            if (packages.contains("com.google.android.gms") || ConfigurationManager.shouldSkipUid(callingUid)) return TransactionResult.ContinueAndSkipPost
             return runCatching {
                 val isBatchMode = code == LIST_ENTRIES_BATCHED_TRANSACTION
                 if (ListEntriesHandler.cacheParameters(txId, data, isBatchMode)) TransactionResult.Continue else TransactionResult.ContinueAndSkipPost
-            }.getOrElse {
-                SystemLogger.error("[TX_ID: $txId] Failed to parse parameters", it)
-                TransactionResult.ContinueAndSkipPost
-            }
+            }.getOrElse { TransactionResult.ContinueAndSkipPost }
         } else if (code == GET_KEY_ENTRY_TRANSACTION || code == DELETE_KEY_TRANSACTION || code == UPDATE_SUBCOMPONENT_TRANSACTION) {
-            logTransaction(txId, transactionNames[code]!!, callingUid, callingPid)
-
             if (ConfigurationManager.shouldSkipUid(callingUid)) return TransactionResult.ContinueAndSkipPost
 
             return try {
@@ -107,17 +98,16 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 data.enforceInterface(IKeystoreService.DESCRIPTOR)
                 val descriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return TransactionResult.ContinueAndSkipPost
 
-                // [核心修复点 1：全局物理扫描缓存池，彻底拦截 Timing Probe 的 KEY_ID 逃逸]
                 var resolvedKeyId: KeyIdentifier? = null
-                if (descriptor.alias != null) {
-                    resolvedKeyId = KeyIdentifier(callingUid, descriptor.alias)
-                } else if (descriptor.domain == Domain.KEY_ID) {
+                if (descriptor.domain == Domain.KEY_ID) {
                     for ((k, v) in KeyMintSecurityLevelInterceptor.generatedKeys) {
                         if (v.nspace == descriptor.nspace && k.uid == callingUid) {
                             resolvedKeyId = k
                             break
                         }
                     }
+                } else if (descriptor.alias != null) {
+                    resolvedKeyId = KeyIdentifier(callingUid, descriptor.alias)
                 }
 
                 if (code == DELETE_KEY_TRANSACTION) {
@@ -145,11 +135,8 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             } catch (e: android.os.ServiceSpecificException) {
                 InterceptorUtils.createErrorReply(e.errorCode)
             } catch (e: Exception) {
-                SystemLogger.error("[TX_ID: $txId] Caught exception, dropping interception", e)
                 TransactionResult.ContinueAndSkipPost
             }
-        } else {
-            logTransaction(txId, transactionNames[code] ?: "unknown code=$code", callingUid, callingPid, true)
         }
         return TransactionResult.ContinueAndSkipPost
     }
@@ -175,15 +162,15 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
 
             runCatching {
                 var keyId: KeyIdentifier? = null
-                if (keyDescriptor.alias != null) {
-                    keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
-                } else if (keyDescriptor.domain == Domain.KEY_ID) {
+                if (keyDescriptor.domain == Domain.KEY_ID) {
                     for ((k, v) in KeyMintSecurityLevelInterceptor.generatedKeys) {
                         if (v.nspace == keyDescriptor.nspace && k.uid == callingUid) {
                             keyId = k
                             break
                         }
                     }
+                } else if (keyDescriptor.alias != null) {
+                    keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
                 }
                 
                 if (keyId == null) return TransactionResult.SkipTransaction
