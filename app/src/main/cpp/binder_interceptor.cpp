@@ -94,9 +94,7 @@ public:
 
 protected:
     status_t onTransact(uint32_t code, const Parcel &data, Parcel *reply, uint32_t flags) override {
-        if (code != intercept::kBackdoorCode) {
-            return UNKNOWN_TRANSACTION;
-        }
+        if (code != intercept::kBackdoorCode) return UNKNOWN_TRANSACTION;
 
         ThreadTransactionInfo info;
         bool found_context = false;
@@ -107,16 +105,12 @@ protected:
             if (it != g_thread_context_map.end() && !it->second.empty()) {
                 info = std::move(it->second.front());
                 it->second.pop();
-                if (it->second.empty()) {
-                    g_thread_context_map.erase(it);
-                }
+                if (it->second.empty()) g_thread_context_map.erase(it);
                 found_context = true;
             }
         }
 
-        if (!found_context) {
-            return UNKNOWN_TRANSACTION;
-        }
+        if (!found_context) return UNKNOWN_TRANSACTION;
 
         if (info.transaction_code == intercept::kBackdoorCode && info.target_binder == nullptr && reply) {
             reply->writeStrongBinder(g_interceptor_instance);
@@ -131,13 +125,25 @@ protected:
             info.transaction_id, real_target, info.transaction_code, data, reply, flags, status);
 
         if (!interceptorManagedFlow) {
-            // [核心修复点：IPC 指针倒带]
-            // 如果拦截器决定放行，必须将 Parcel 的读取指针重置为 0。
-            // 因为系统 libbinder 在调用我们之前，已经消费了 Interface Token。
-            // 若不重置直接发给 real_target，原生硬件会读取到偏移后的脏数据并抛出致命异常！
-            const_cast<Parcel*>(&data)->setDataPosition(0);
             status = real_target->transact(info.transaction_code, data, reply, flags);
         }
+
+        // [终极核心：物理级全局异常清洗器]
+        // 彻底拦截并清洗因 Kotlin 运行时引发的私有 Binder 异常泄露！
+        if (reply && status == OK && reply->dataSize() >= 4) {
+            const int32_t* data_ptr = reinterpret_cast<const int32_t*>(reply->data());
+            int32_t header = data_ptr[0];
+            // Android AIDL 的正常异常头应为 -8 (EX_SERVICE_SPECIFIC)
+            // 任何其他的负数头（如 -128 运行时异常）都会暴露模拟器身份
+            if (header < 0 && header != -8 && header != -129 /* EX_TRANSACTION_FAILED */) {
+                LOGE("[Sanitizer] Blocked Java exception leak! header: %d", header);
+                reply->setDataPosition(0);
+                reply->writeInt32(-8); // 重写为合法的 ServiceSpecificException
+                reply->writeInt32(-1000); // 注入 KM_ERROR_UNKNOWN_ERROR
+                reply->setDataSize(8); // 物理截断后续的 Java Stack Trace 字符串！
+            }
+        }
+
         return status;
     }
 };
@@ -174,9 +180,7 @@ void inspectAndRewriteTransaction(binder_transaction_data *txn_data) {
     }
 
     if (hijack) {
-        uint64_t tx_id = ++g_transaction_id_counter;
-        info.transaction_id = tx_id;
-
+        info.transaction_id = ++g_transaction_id_counter;
         txn_data->target.ptr = reinterpret_cast<uintptr_t>(g_stub_instance->getWeakRefs());
         txn_data->cookie = reinterpret_cast<uintptr_t>(g_stub_instance.get());
         txn_data->code = intercept::kBackdoorCode;
@@ -210,7 +214,7 @@ void processBinderReadBuffer(const binder_write_read &bwr) {
         ptr += cmd_size;
     }
 }
-} 
+}
 
 int intercepted_ioctl(int fd, int request, ...) {
     va_list ap;
@@ -243,12 +247,9 @@ int intercepted_ioctl(int fd, int request, ...) {
 
 status_t BinderInterceptor::onTransact(uint32_t code, const Parcel &data, Parcel *reply, uint32_t flags) {
     switch (code) {
-    case intercept::kRegisterInterceptor:
-        return handleRegister(data);
-    case intercept::kUnregisterInterceptor:
-        return handleUnregister(data);
-    default:
-        return BBinder::onTransact(code, data, reply, flags);
+    case intercept::kRegisterInterceptor: return handleRegister(data);
+    case intercept::kUnregisterInterceptor: return handleUnregister(data);
+    default: return BBinder::onTransact(code, data, reply, flags);
     }
 }
 
@@ -310,10 +311,7 @@ bool BinderInterceptor::processInterceptedTransaction(uint64_t tx_id, sp<BBinder
 
     status_t pre_status = callback->transact(intercept::kPreTransact, pre_req, &pre_resp);
     if (pre_status != OK) {
-        if (callback->pingBinder() != OK) {
-            result = DEAD_OBJECT;
-            return true;
-        }
+        if (callback->pingBinder() != OK) { result = DEAD_OBJECT; return true; }
         return false;
     }
 
@@ -329,26 +327,16 @@ bool BinderInterceptor::processInterceptedTransaction(uint64_t tx_id, sp<BBinder
         return true;
     }
 
-    if (action == intercept::kActionSkipTransaction) {
-        result = OK;
-        return true;
-    }
-
-    if (action == intercept::kActionContinueAndSkipPost) {
-        result = OK;
-        return false;
-    }
+    if (action == intercept::kActionSkipTransaction) { result = OK; return true; }
+    if (action == intercept::kActionContinueAndSkipPost) { result = OK; return false; }
 
     Parcel final_request;
     if (action == intercept::kActionOverrideData) {
         size_t size = pre_resp.readUint64();
         final_request.appendFrom(&pre_resp, pre_resp.dataPosition(), size);
-        // [核心修复点：覆写数据后的指针倒带]
         final_request.setDataPosition(0);
         result = target->transact(code, final_request, reply, flags);
     } else {
-        // [核心修复点：透传时的指针倒带]
-        const_cast<Parcel*>(&request)->setDataPosition(0);
         result = target->transact(code, request, reply, flags);
     }
 
@@ -376,16 +364,11 @@ bool BinderInterceptor::processInterceptedTransaction(uint64_t tx_id, sp<BBinder
 
 bool initialize_hooks() {
     auto maps = lsplt::MapInfo::Scan();
-    dev_t binder_dev = 0;
-    ino_t binder_ino = 0;
-    bool found = false;
+    dev_t binder_dev = 0; ino_t binder_ino = 0; bool found = false;
 
     for (const auto &map : maps) {
         if (map.path.ends_with(intercept::kBinderLibName)) {
-            binder_dev = map.dev;
-            binder_ino = map.inode;
-            found = true;
-            break;
+            binder_dev = map.dev; binder_ino = map.inode; found = true; break;
         }
     }
     if (!found) return false;
@@ -400,6 +383,4 @@ bool initialize_hooks() {
 }
 
 extern "C" [[gnu::visibility("default")]] [[gnu::used]]
-bool entry(void *handle) {
-    return initialize_hooks();
-}
+bool entry(void *handle) { return initialize_hooks(); }
