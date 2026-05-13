@@ -35,7 +35,10 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
 
     private val transactionNames: Map<Int, String> by lazy {
         stubBinderClass.declaredFields
-            .filter { it.isAccessible = true && it.type == Int::class.java && it.name.startsWith("TRANSACTION_") }
+            .filter { 
+                it.isAccessible = true
+                it.type == Int::class.java && it.name.startsWith("TRANSACTION_") 
+            }
             .associate { field -> (field.get(null) as Int) to field.name.split("_")[1] }
     }
 
