@@ -204,9 +204,7 @@ class SoftwareOperation(
     @Volatile var finalized = false
         private set
 
-    // [修复点] 记录是否已经开始处理数据内容
     private var isDataStarted = false
-
     var onFinishCallback: (() -> Unit)? = null
 
     val beginParameters: KeyParameters?
@@ -219,7 +217,6 @@ class SoftwareOperation(
     init {
         val purpose = params.purpose.firstOrNull()
         val purposeName = KeyMintParameterLogger.purposeNames[purpose] ?: "UNKNOWN"
-        SystemLogger.debug("[SoftwareOp TX_ID: $txId] Initializing for purpose: $purposeName.")
 
         primitive =
             when (purpose) {
@@ -244,25 +241,21 @@ class SoftwareOperation(
 
     private fun checkActive() {
         if (finalized) {
-            SystemLogger.debug("[SoftwareOp TX_ID: $txId] Rejected: operation already finalized (pruned or completed)")
             throw ServiceSpecificException(KeystoreErrorCodes.invalidOperationHandle)
         }
     }
 
     private fun checkInputLength(data: ByteArray?) {
         if (data != null && data.size > MAX_RECEIVE_DATA) {
-            SystemLogger.info("[SoftwareOp TX_ID: $txId] Input too large: ${data.size} > $MAX_RECEIVE_DATA, throwing TOO_MUCH_DATA(${KeystoreErrorCodes.tooMuchData})")
-            throw ServiceSpecificException(KeystoreErrorCodes.tooMuchData)
+            // [修复点] 使用标准的负数 KM_ERROR_INVALID_INPUT_LENGTH，防漏报
+            throw ServiceSpecificException(KeystoreErrorCodes.invalidInputLength) 
         }
     }
 
     fun updateAad(aadInput: ByteArray?) {
-        SystemLogger.debug("[SoftwareOp TX_ID: $txId] updateAad() inputSize=${aadInput?.size ?: 0}")
         checkActive()
         
-        // [修复点] 如果已经调用过 update，则必须返回 INVALID_TAG (-76)
         if (isDataStarted) {
-            SystemLogger.warning("[SoftwareOp TX_ID: $txId] updateAad called after update, throwing INVALID_TAG")
             throw ServiceSpecificException(KeystoreErrorCodes.invalidTag)
         }
         
@@ -277,10 +270,7 @@ class SoftwareOperation(
     }
 
     fun update(data: ByteArray?): ByteArray? {
-        SystemLogger.debug("[SoftwareOp TX_ID: $txId] update() inputSize=${data?.size ?: 0}")
         checkActive()
-        
-        // [修复点] 标记已进入数据阶段，后续不再接受 AAD
         isDataStarted = true
         
         checkInputLength(data)
@@ -289,7 +279,6 @@ class SoftwareOperation(
         } catch (e: ServiceSpecificException) {
             throw e
         } catch (e: Exception) {
-            SystemLogger.error("[SoftwareOp TX_ID: $txId] Failed to update operation.", e)
             throw mapToServiceSpecificException(e)
         }
     }
@@ -307,12 +296,10 @@ class SoftwareOperation(
             }
             finalized = true
             onFinishCallback?.invoke()
-            SystemLogger.info("[SoftwareOp TX_ID: $txId] Finished operation successfully.")
             return result
         } catch (e: ServiceSpecificException) {
             throw e
         } catch (e: Exception) {
-            SystemLogger.error("[SoftwareOp TX_ID: $txId] Failed to finish operation.", e)
             throw mapToServiceSpecificException(e)
         }
     }
@@ -320,17 +307,16 @@ class SoftwareOperation(
     fun abort() {
         finalized = true
         primitive.abort()
-        SystemLogger.debug("[SoftwareOp TX_ID: $txId] Operation aborted.")
     }
 
-    // [修复点] 增强错误映射，处理 JCA 的状态异常
+    // [修复点] 彻底围剿非法入参和状态异常引发的泄露
     private fun mapToServiceSpecificException(e: Exception): ServiceSpecificException = when (e) {
         is SignatureException -> ServiceSpecificException(KeystoreErrorCodes.verificationFailed, e.message)
         is javax.crypto.BadPaddingException -> ServiceSpecificException(KeystoreErrorCodes.invalidArgument, e.message)
         is javax.crypto.IllegalBlockSizeException -> ServiceSpecificException(KeystoreErrorCodes.invalidInputLength, e.message)
         is java.security.InvalidKeyException -> ServiceSpecificException(KeystoreErrorCodes.incompatibleKey, e.message)
-        // [修复点] 将 JCA 的状态异常映射为 Keystore 的语义错误
-        is IllegalStateException -> ServiceSpecificException(KeystoreErrorCodes.invalidTag, "Operation in wrong state: ${e.message}")
+        is IllegalStateException -> ServiceSpecificException(KeystoreErrorCodes.invalidTag, e.message)
+        is IllegalArgumentException -> ServiceSpecificException(KeystoreErrorCodes.invalidArgument, e.message)
         else -> ServiceSpecificException(KeystoreErrorCodes.unknownError, e.message)
     }
 
@@ -340,75 +326,26 @@ class SoftwareOperation(
 }
 
 internal object KeystoreErrorCodes {
-    val tooMuchData: Int by lazy {
-        resolveField("android.system.keystore2.ResponseCode", "TOO_MUCH_DATA", 21)
-    }
-
-    val invalidOperationHandle: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "INVALID_OPERATION_HANDLE", -28)
-    }
-
-    val invalidTag: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "INVALID_TAG", -76)
-    }
-
-    val verificationFailed: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "VERIFICATION_FAILED", -30)
-    }
-
-    val invalidArgument: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "INVALID_ARGUMENT", -38)
-    }
-
-    val invalidInputLength: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "INVALID_INPUT_LENGTH", -21)
-    }
-
-    val incompatibleKey: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "INCOMPATIBLE_KEY", -31)
-    }
-
-    val incompatiblePurpose: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "INCOMPATIBLE_PURPOSE", -13)
-    }
-
-    val unsupportedPurpose: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "UNSUPPORTED_PURPOSE", -14)
-    }
-
-    val incompatibleAlgorithm: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "INCOMPATIBLE_ALGORITHM", -18)
-    }
-
-    val keyNotYetValid: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "KEY_NOT_YET_VALID", -39)
-    }
-
-    val keyExpired: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "KEY_EXPIRED", -40)
-    }
-
-    val callerNonceProhibited: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "CALLER_NONCE_PROHIBITED", -55)
-    }
-
-    val unknownError: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "UNKNOWN_ERROR", -1000)
-    }
+    val invalidOperationHandle: Int by lazy { resolveField("android.hardware.security.keymint.ErrorCode", "INVALID_OPERATION_HANDLE", -28) }
+    val invalidTag: Int by lazy { resolveField("android.hardware.security.keymint.ErrorCode", "INVALID_TAG", -76) }
+    val verificationFailed: Int by lazy { resolveField("android.hardware.security.keymint.ErrorCode", "VERIFICATION_FAILED", -30) }
+    val invalidArgument: Int by lazy { resolveField("android.hardware.security.keymint.ErrorCode", "INVALID_ARGUMENT", -38) }
+    val invalidInputLength: Int by lazy { resolveField("android.hardware.security.keymint.ErrorCode", "INVALID_INPUT_LENGTH", -21) }
+    val incompatibleKey: Int by lazy { resolveField("android.hardware.security.keymint.ErrorCode", "INCOMPATIBLE_KEY", -31) }
+    val incompatiblePurpose: Int by lazy { resolveField("android.hardware.security.keymint.ErrorCode", "INCOMPATIBLE_PURPOSE", -13) }
+    val unsupportedPurpose: Int by lazy { resolveField("android.hardware.security.keymint.ErrorCode", "UNSUPPORTED_PURPOSE", -14) }
+    val incompatibleAlgorithm: Int by lazy { resolveField("android.hardware.security.keymint.ErrorCode", "INCOMPATIBLE_ALGORITHM", -18) }
+    val unknownError: Int by lazy { resolveField("android.hardware.security.keymint.ErrorCode", "UNKNOWN_ERROR", -1000) }
 
     fun resolveField(className: String, fieldName: String, fallback: Int): Int =
         runCatching {
             Class.forName(className).getField(fieldName).getInt(null)
-        }.getOrElse {
-            SystemLogger.debug("Resolved $className.$fieldName via fallback: $fallback")
-            fallback
-        }
+        }.getOrElse { fallback }
 }
 
 class SoftwareOperationBinder(private val operation: SoftwareOperation) :
     IKeystoreOperation.Stub() {
 
-    // [修复点] 统一的异常捕获执行块，防止任何底层异常穿透到 Binder 驱动
     private inline fun <T> safeCall(block: () -> T): T {
         return try {
             block()
