@@ -138,10 +138,10 @@ class SoftwareOperation(private val txId: Long, keyPair: KeyPair?, secretKey: ja
     }
 
     fun updateAad(aadInput: ByteArray?) {
-        if (aadInput == null || aadInput.isEmpty()) return
-
         checkActive()
+        // [核心修复点] 即使探针故意传入 Empty Array，也必须先执行状态封锁，强制返回 INVALID_TAG (-76)
         if (isDataStarted) throw ServiceSpecificException(KeystoreErrorCodes.invalidTag)
+        if (aadInput == null || aadInput.isEmpty()) return
         
         checkInputLength(aadInput)
         try {
@@ -216,17 +216,18 @@ internal object KeystoreErrorCodes {
 
 class SoftwareOperationBinder(private val operation: SoftwareOperation) : IKeystoreOperation.Stub() {
 
-    // [修复核心2：释放合法的 ServiceSpecificException，满足探针的断言期望]
+    // [核心修复点] 将探针发送畸形包导致的崩溃，用标准的原生异常流伪装封包返回，绝不暴漏给外部
     override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
         try {
             return super.onTransact(code, data, reply, flags)
-        } catch (e: android.os.ServiceSpecificException) {
-            // 这是被探针允许且期待的底层报错（如 INVALID_TAG -76）
-            // 抛出后让 Android 自动转换为 EX_SERVICE_SPECIFIC，不会判定为私有异常
-            throw e
         } catch (e: Exception) {
             SystemLogger.error("SoftwareOperationBinder: Probe malformed parcel intercepted", e)
-            throw android.os.ServiceSpecificException(KeystoreErrorCodes.invalidArgument, e.message)
+            if (reply != null) {
+                reply.setDataPosition(0)
+                reply.writeException(android.os.ServiceSpecificException(KeystoreErrorCodes.invalidArgument, e.message ?: "Malformed"))
+                return true
+            }
+            return false
         }
     }
 
