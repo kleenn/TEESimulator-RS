@@ -60,6 +60,8 @@ private object JcaAlgorithmMapper {
 
 private class Signer(keyPair: KeyPair, params: KeyMintAttestation) : CryptoPrimitive {
     private val signature: Signature = Signature.getInstance(JcaAlgorithmMapper.mapSignatureAlgorithm(params)).apply { initSign(keyPair.private) }
+    // [核心修复点]：显式重写接口方法，防 DEX 默认方法消除！让抛出的 -76 切实抵达调用方！
+    override fun updateAad(aadInput: ByteArray?) { throw ServiceSpecificException(KeystoreErrorCodes.invalidTag) }
     override fun update(data: ByteArray?): ByteArray? { if (data != null) signature.update(data); return null }
     override fun finish(data: ByteArray?, sig: ByteArray?): ByteArray { if (data != null) update(data); return signature.sign() }
     override fun abort() {}
@@ -67,6 +69,7 @@ private class Signer(keyPair: KeyPair, params: KeyMintAttestation) : CryptoPrimi
 
 private class Verifier(keyPair: KeyPair, params: KeyMintAttestation) : CryptoPrimitive {
     private val signature: Signature = Signature.getInstance(JcaAlgorithmMapper.mapSignatureAlgorithm(params)).apply { initVerify(keyPair.public) }
+    override fun updateAad(aadInput: ByteArray?) { throw ServiceSpecificException(KeystoreErrorCodes.invalidTag) }
     override fun update(data: ByteArray?): ByteArray? { if (data != null) signature.update(data); return null }
     override fun finish(data: ByteArray?, sig: ByteArray?): ByteArray? {
         if (data != null) update(data)
@@ -96,6 +99,7 @@ private class CipherPrimitive(cryptoKey: java.security.Key, params: KeyMintAttes
 
 private class KeyAgreementPrimitive(keyPair: KeyPair) : CryptoPrimitive {
     private val agreement: javax.crypto.KeyAgreement = javax.crypto.KeyAgreement.getInstance("ECDH").apply { init(keyPair.private) }
+    override fun updateAad(aadInput: ByteArray?) { throw ServiceSpecificException(KeystoreErrorCodes.invalidTag) }
     override fun update(data: ByteArray?): ByteArray? = null
     override fun finish(data: ByteArray?, sig: ByteArray?): ByteArray? {
         if (data == null) throw ServiceSpecificException(KeystoreErrorCodes.invalidArgument)
@@ -128,12 +132,19 @@ class SoftwareOperation(private val txId: Long, keyPair: KeyPair?, secretKey: ja
     }
 
     private fun checkActive() { if (finalized) throw ServiceSpecificException(KeystoreErrorCodes.invalidOperationHandle) }
-    private fun checkInputLength(data: ByteArray?) { if (data != null && data.size > 0x8000) throw ServiceSpecificException(KeystoreErrorCodes.invalidInputLength) }
+
+    private fun checkInputLength(data: ByteArray?) {
+        if (data != null && data.size > 0x8000) throw ServiceSpecificException(KeystoreErrorCodes.invalidInputLength)
+    }
 
     fun updateAad(aadInput: ByteArray?) {
         checkActive()
-        // [终极物理硬编码] 无视所有逻辑调用，强行对 Duck Detector 的探针输入抛出底层预期的错误码
-        throw ServiceSpecificException(KeystoreErrorCodes.invalidTag)
+        if (isDataStarted) throw ServiceSpecificException(KeystoreErrorCodes.invalidTag)
+        
+        checkInputLength(aadInput)
+        try { primitive.updateAad(aadInput) } 
+        catch (e: ServiceSpecificException) { throw e } 
+        catch (e: Exception) { throw mapToServiceSpecificException(e) }
     }
 
     fun update(data: ByteArray?): ByteArray? {
@@ -145,9 +156,8 @@ class SoftwareOperation(private val txId: Long, keyPair: KeyPair?, secretKey: ja
         checkActive()
         isDataStarted = true
         checkInputLength(data)
-        try {
-            return primitive.update(data)
-        } catch (e: ServiceSpecificException) { throw e } 
+        try { return primitive.update(data) } 
+        catch (e: ServiceSpecificException) { throw e } 
         catch (e: Exception) { throw mapToServiceSpecificException(e) }
     }
 
