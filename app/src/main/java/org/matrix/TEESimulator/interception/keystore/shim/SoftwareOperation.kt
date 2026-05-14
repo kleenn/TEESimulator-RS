@@ -10,8 +10,6 @@ import android.hardware.security.keymint.PaddingMode
 import android.hardware.security.keymint.Tag
 import android.os.ServiceSpecificException
 import android.os.Parcel
-import android.os.Binder
-import android.util.Log
 import java.util.concurrent.locks.LockSupport
 import android.system.keystore2.IKeystoreOperation
 import android.system.keystore2.KeyParameters
@@ -20,16 +18,7 @@ import java.security.Signature
 import java.security.SignatureException
 import javax.crypto.Cipher
 import org.matrix.TEESimulator.attestation.KeyMintAttestation
-import org.matrix.TEESimulator.config.ConfigurationManager
-
-private const val TRACE_TAG = "TEESim_Trace"
-
-private fun traceOp(message: String) {
-    val uid = Binder.getCallingUid()
-    if (ConfigurationManager.shouldPatch(uid)) {
-        Log.i(TRACE_TAG, "[UID:$uid] [SoftwareOperation] $message")
-    }
-}
+import org.matrix.TEESimulator.logging.SystemLogger
 
 private sealed interface CryptoPrimitive {
     fun updateAad(aadInput: ByteArray?) { throw ServiceSpecificException(KeystoreErrorCodes.invalidTag) }
@@ -130,7 +119,6 @@ class SoftwareOperation(private val txId: Long, keyPair: KeyPair?, secretKey: ja
 
     init {
         val purpose = params.purpose.firstOrNull()
-        traceOp("Operation Initialized. Purpose: $purpose")
         primitive = when (purpose) {
             KeyPurpose.SIGN -> Signer(keyPair!!, params)
             KeyPurpose.VERIFY -> Verifier(keyPair!!, params)
@@ -148,18 +136,16 @@ class SoftwareOperation(private val txId: Long, keyPair: KeyPair?, secretKey: ja
     }
 
     fun updateAad(aadInput: ByteArray?) {
-        traceOp("updateAad called. inputSize=${aadInput?.size ?: 0}")
         checkActive()
         if (isDataStarted) throw ServiceSpecificException(KeystoreErrorCodes.invalidTag)
         
         checkInputLength(aadInput)
         try { primitive.updateAad(aadInput) } 
-        catch (e: ServiceSpecificException) { traceOp("updateAad rejecting with: ${e.errorCode}"); throw e } 
+        catch (e: ServiceSpecificException) { throw e } 
         catch (e: Exception) { throw mapToServiceSpecificException(e) }
     }
 
     fun update(data: ByteArray?): ByteArray? {
-        traceOp("update called. inputSize=${data?.size ?: 0}")
         if (data == null || data.isEmpty()) {
             checkActive()
             isDataStarted = true
@@ -174,7 +160,6 @@ class SoftwareOperation(private val txId: Long, keyPair: KeyPair?, secretKey: ja
     }
 
     fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? {
-        traceOp("finish called. inputSize=${data?.size ?: 0}")
         checkActive()
         checkInputLength(data)
         try {
@@ -187,14 +172,11 @@ class SoftwareOperation(private val txId: Long, keyPair: KeyPair?, secretKey: ja
             finalized = true
             onFinishCallback?.invoke()
             return result
-        } catch (e: ServiceSpecificException) { traceOp("finish rejecting with: ${e.errorCode}"); throw e } 
+        } catch (e: ServiceSpecificException) { throw e } 
         catch (e: Exception) { throw mapToServiceSpecificException(e) }
     }
 
-    fun abort() {
-        traceOp("abort called.")
-        finalized = true; primitive.abort() 
-    }
+    fun abort() { finalized = true; primitive.abort() }
 
     private fun mapToServiceSpecificException(e: Exception): ServiceSpecificException = when (e) {
         is SignatureException -> ServiceSpecificException(KeystoreErrorCodes.verificationFailed, e.message)
@@ -232,7 +214,7 @@ class SoftwareOperationBinder(private val operation: SoftwareOperation) : IKeyst
         try {
             return super.onTransact(code, data, reply, flags)
         } catch (e: Exception) {
-            traceOp("onTransact Caught Exception: ${e.javaClass.simpleName}, message=${e.message}")
+            SystemLogger.error("SoftwareOperationBinder: Caught exception during transact", e)
             if (reply != null) {
                 reply.setDataPosition(0)
                 reply.writeInt(-8) // EX_SERVICE_SPECIFIC
