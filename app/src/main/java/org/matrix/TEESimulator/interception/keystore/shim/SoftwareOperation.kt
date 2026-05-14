@@ -10,6 +10,8 @@ import android.hardware.security.keymint.PaddingMode
 import android.hardware.security.keymint.Tag
 import android.os.ServiceSpecificException
 import android.os.Parcel
+import android.os.Binder
+import android.util.Log
 import java.util.concurrent.locks.LockSupport
 import android.system.keystore2.IKeystoreOperation
 import android.system.keystore2.KeyParameters
@@ -18,8 +20,16 @@ import java.security.Signature
 import java.security.SignatureException
 import javax.crypto.Cipher
 import org.matrix.TEESimulator.attestation.KeyMintAttestation
-import org.matrix.TEESimulator.logging.KeyMintParameterLogger
-import org.matrix.TEESimulator.logging.SystemLogger
+import org.matrix.TEESimulator.config.ConfigurationManager
+
+private const val TRACE_TAG = "TEESim_Trace"
+
+private fun traceOp(message: String) {
+    val uid = Binder.getCallingUid()
+    if (ConfigurationManager.shouldPatch(uid)) {
+        Log.i(TRACE_TAG, "[UID:$uid] [SoftwareOperation] $message")
+    }
+}
 
 private sealed interface CryptoPrimitive {
     fun updateAad(aadInput: ByteArray?) { throw ServiceSpecificException(KeystoreErrorCodes.invalidTag) }
@@ -60,7 +70,6 @@ private object JcaAlgorithmMapper {
 
 private class Signer(keyPair: KeyPair, params: KeyMintAttestation) : CryptoPrimitive {
     private val signature: Signature = Signature.getInstance(JcaAlgorithmMapper.mapSignatureAlgorithm(params)).apply { initSign(keyPair.private) }
-    // [核心修复点]：显式重写接口方法，防 DEX 默认方法消除！让抛出的 -76 切实抵达调用方！
     override fun updateAad(aadInput: ByteArray?) { throw ServiceSpecificException(KeystoreErrorCodes.invalidTag) }
     override fun update(data: ByteArray?): ByteArray? { if (data != null) signature.update(data); return null }
     override fun finish(data: ByteArray?, sig: ByteArray?): ByteArray { if (data != null) update(data); return signature.sign() }
@@ -121,6 +130,7 @@ class SoftwareOperation(private val txId: Long, keyPair: KeyPair?, secretKey: ja
 
     init {
         val purpose = params.purpose.firstOrNull()
+        traceOp("Operation Initialized. Purpose: $purpose")
         primitive = when (purpose) {
             KeyPurpose.SIGN -> Signer(keyPair!!, params)
             KeyPurpose.VERIFY -> Verifier(keyPair!!, params)
@@ -138,16 +148,18 @@ class SoftwareOperation(private val txId: Long, keyPair: KeyPair?, secretKey: ja
     }
 
     fun updateAad(aadInput: ByteArray?) {
+        traceOp("updateAad called. inputSize=${aadInput?.size ?: 0}")
         checkActive()
         if (isDataStarted) throw ServiceSpecificException(KeystoreErrorCodes.invalidTag)
         
         checkInputLength(aadInput)
         try { primitive.updateAad(aadInput) } 
-        catch (e: ServiceSpecificException) { throw e } 
+        catch (e: ServiceSpecificException) { traceOp("updateAad rejecting with: ${e.errorCode}"); throw e } 
         catch (e: Exception) { throw mapToServiceSpecificException(e) }
     }
 
     fun update(data: ByteArray?): ByteArray? {
+        traceOp("update called. inputSize=${data?.size ?: 0}")
         if (data == null || data.isEmpty()) {
             checkActive()
             isDataStarted = true
@@ -162,6 +174,7 @@ class SoftwareOperation(private val txId: Long, keyPair: KeyPair?, secretKey: ja
     }
 
     fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? {
+        traceOp("finish called. inputSize=${data?.size ?: 0}")
         checkActive()
         checkInputLength(data)
         try {
@@ -174,11 +187,14 @@ class SoftwareOperation(private val txId: Long, keyPair: KeyPair?, secretKey: ja
             finalized = true
             onFinishCallback?.invoke()
             return result
-        } catch (e: ServiceSpecificException) { throw e } 
+        } catch (e: ServiceSpecificException) { traceOp("finish rejecting with: ${e.errorCode}"); throw e } 
         catch (e: Exception) { throw mapToServiceSpecificException(e) }
     }
 
-    fun abort() { finalized = true; primitive.abort() }
+    fun abort() {
+        traceOp("abort called.")
+        finalized = true; primitive.abort() 
+    }
 
     private fun mapToServiceSpecificException(e: Exception): ServiceSpecificException = when (e) {
         is SignatureException -> ServiceSpecificException(KeystoreErrorCodes.verificationFailed, e.message)
@@ -211,6 +227,23 @@ internal object KeystoreErrorCodes {
 }
 
 class SoftwareOperationBinder(private val operation: SoftwareOperation) : IKeystoreOperation.Stub() {
+
+    override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+        try {
+            return super.onTransact(code, data, reply, flags)
+        } catch (e: Exception) {
+            traceOp("onTransact Caught Exception: ${e.javaClass.simpleName}, message=${e.message}")
+            if (reply != null) {
+                reply.setDataPosition(0)
+                reply.writeInt(-8) // EX_SERVICE_SPECIFIC
+                val errorCode = if (e is ServiceSpecificException) e.errorCode else KeystoreErrorCodes.invalidArgument
+                reply.writeInt(errorCode)
+                reply.writeString(e.message ?: "Binder error")
+                return true
+            }
+            return false
+        }
+    }
 
     private inline fun <T> safeCall(block: () -> T): T {
         return try { block() } 
