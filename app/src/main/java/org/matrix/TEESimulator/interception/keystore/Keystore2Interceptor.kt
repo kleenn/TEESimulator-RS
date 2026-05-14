@@ -9,6 +9,7 @@ import android.system.keystore2.Domain
 import android.system.keystore2.IKeystoreService
 import android.system.keystore2.KeyDescriptor
 import android.system.keystore2.KeyEntryResponse
+import android.util.Log
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
 import org.matrix.TEESimulator.attestation.AttestationPatcher
@@ -22,6 +23,15 @@ import org.matrix.TEESimulator.pki.CertificateHelper
 
 @SuppressLint("BlockedPrivateApi")
 object Keystore2Interceptor : AbstractKeystoreInterceptor() {
+    private const val TRACE_TAG = "TEESim_Trace"
+
+    // 专属的精准溯源日志函数
+    private fun trace(uid: Int, txId: Long, message: String) {
+        if (ConfigurationManager.shouldPatch(uid)) {
+            Log.i(TRACE_TAG, "[UID:$uid] [TX:$txId] $message")
+        }
+    }
+
     private val stubBinderClass = IKeystoreService.Stub::class.java
 
     private val GET_KEY_ENTRY_TRANSACTION = InterceptorUtils.getTransactCode(stubBinderClass, "getKeyEntry")
@@ -30,7 +40,6 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
     private val LIST_ENTRIES_TRANSACTION = InterceptorUtils.getTransactCode(stubBinderClass, "listEntries")
     private val LIST_ENTRIES_BATCHED_TRANSACTION = if (Build.VERSION.SDK_INT >= 34) InterceptorUtils.getTransactCode(stubBinderClass, "listEntriesBatched") else null
     private val GET_NUMBER_OF_ENTRIES_TRANSACTION = InterceptorUtils.getTransactCode(stubBinderClass, "getNumberOfEntries")
-    // [核对点]：确保已加入 getSecurityLevel 的反射获取
     private val GET_SECURITY_LEVEL_TRANSACTION = InterceptorUtils.getTransactCode(stubBinderClass, "getSecurityLevel")
 
     private val transactionNames: Map<Int, String> by lazy {
@@ -42,8 +51,6 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
     private const val RESPONSE_KEY_NOT_FOUND = 7
     private val deletedSoftwareKeys: MutableSet<KeyIdentifier> = ConcurrentHashMap.newKeySet()
     private val userUpdatedKeys = ConcurrentHashMap.newKeySet<KeyIdentifier>()
-
-    // [核对点]：用于向 C++ 动态注册私有会话拦截的后门句柄
     private lateinit var interceptorBackdoor: IBinder
 
     override val serviceName = "android.system.keystore2.IKeystoreService/default"
@@ -54,12 +61,12 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
         listOfNotNull(
             GET_KEY_ENTRY_TRANSACTION, DELETE_KEY_TRANSACTION, UPDATE_SUBCOMPONENT_TRANSACTION,
             LIST_ENTRIES_TRANSACTION, LIST_ENTRIES_BATCHED_TRANSACTION, GET_NUMBER_OF_ENTRIES_TRANSACTION,
-            GET_SECURITY_LEVEL_TRANSACTION // [核对点]：务必挂载此代码
+            GET_SECURITY_LEVEL_TRANSACTION
         ).toIntArray()
     }
 
     override fun onInterceptorReady(service: IBinder, backdoor: IBinder) {
-        interceptorBackdoor = backdoor // 保存后门
+        interceptorBackdoor = backdoor
         val keystoreInterface = IKeystoreService.Stub.asInterface(service)
         setupSecurityLevelInterceptors(keystoreInterface, backdoor)
     }
@@ -72,7 +79,6 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 interceptor.loadPersistedKeys()
             }
         }.onFailure { SystemLogger.error("Failed to intercept TEE SecurityLevel.", it) }
-
         runCatching {
             service.getSecurityLevel(SecurityLevel.STRONGBOX)?.let { strongbox ->
                 val interceptor = KeyMintSecurityLevelInterceptor(strongbox, SecurityLevel.STRONGBOX)
@@ -82,17 +88,16 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
         }.onFailure { SystemLogger.error("Failed to intercept StrongBox SecurityLevel.", it) }
     }
 
-    override fun onPreTransact(
-        txId: Long, target: IBinder, code: Int, flags: Int, callingUid: Int, callingPid: Int, data: Parcel
-    ): TransactionResult {
+    override fun onPreTransact(txId: Long, target: IBinder, code: Int, flags: Int, callingUid: Int, callingPid: Int, data: Parcel): TransactionResult {
+        val txName = transactionNames[code] ?: "UNKNOWN_CODE_$code"
+        trace(callingUid, txId, "==> onPreTransact: $txName started")
+
         if (code == GET_SECURITY_LEVEL_TRANSACTION) {
-            // 对私有会话的申请直接放行，转交硬件创建，在 post 阶段再行捕获
             return TransactionResult.Continue
         } else if (code == GET_NUMBER_OF_ENTRIES_TRANSACTION) {
             return if (ConfigurationManager.shouldSkipUid(callingUid)) TransactionResult.ContinueAndSkipPost else TransactionResult.Continue
         } else if (code == LIST_ENTRIES_TRANSACTION || code == LIST_ENTRIES_BATCHED_TRANSACTION) {
-            val packages = ConfigurationManager.getPackagesForUid(callingUid).joinToString()
-            if (packages.contains("com.google.android.gms") || ConfigurationManager.shouldSkipUid(callingUid)) return TransactionResult.ContinueAndSkipPost
+            if (ConfigurationManager.shouldSkipUid(callingUid)) return TransactionResult.ContinueAndSkipPost
             return runCatching {
                 val isBatchMode = code == LIST_ENTRIES_BATCHED_TRANSACTION
                 if (ListEntriesHandler.cacheParameters(txId, data, isBatchMode)) TransactionResult.Continue else TransactionResult.ContinueAndSkipPost
@@ -104,9 +109,13 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 if (code == UPDATE_SUBCOMPONENT_TRANSACTION) return handleUpdateSubcomponent(callingUid, data)
 
                 data.enforceInterface(IKeystoreService.DESCRIPTOR)
-                val descriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return TransactionResult.ContinueAndSkipPost
+                val descriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: run {
+                    trace(callingUid, txId, "onPreTransact: Failed to read KeyDescriptor, routing to ContinueAndSkipPost")
+                    return TransactionResult.ContinueAndSkipPost
+                }
 
-                // [核对点]：强遍历解析 KEY_ID 以防止逃逸
+                trace(callingUid, txId, "Parsed Descriptor -> Domain: ${descriptor.domain}, Alias: ${descriptor.alias}, NSpace: ${descriptor.nspace}")
+
                 var resolvedKeyId: KeyIdentifier? = null
                 if (descriptor.domain == Domain.KEY_ID) {
                     for ((k, v) in KeyMintSecurityLevelInterceptor.generatedKeys) {
@@ -115,14 +124,17 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                             break
                         }
                     }
+                    trace(callingUid, txId, "Domain is KEY_ID. Resolution result: ${resolvedKeyId != null}")
                 } else if (descriptor.alias != null) {
                     resolvedKeyId = KeyIdentifier(callingUid, descriptor.alias)
+                    trace(callingUid, txId, "Domain is APP/Alias. Resolved KeyIdentifier: $resolvedKeyId")
                 }
 
                 if (code == DELETE_KEY_TRANSACTION) {
                     if (resolvedKeyId != null) {
                         val isSoftwareKey = KeyMintSecurityLevelInterceptor.generatedKeys.containsKey(resolvedKeyId)
                         KeyMintSecurityLevelInterceptor.cleanupKeyData(resolvedKeyId)
+                        trace(callingUid, txId, "DELETE_KEY intercepted. isSoftwareKey=$isSoftwareKey")
                         if (isSoftwareKey) {
                             deletedSoftwareKeys.add(resolvedKeyId)
                             return InterceptorUtils.createSuccessReply(writeResultCode = false)
@@ -131,31 +143,33 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                     return TransactionResult.ContinueAndSkipPost
                 }
 
-                if (resolvedKeyId == null) return TransactionResult.ContinueAndSkipPost
+                if (resolvedKeyId == null) {
+                    trace(callingUid, txId, "Key not found in local cache. Leaking to original hardware keystore.")
+                    return TransactionResult.ContinueAndSkipPost
+                }
 
                 val response = KeyMintSecurityLevelInterceptor.getGeneratedKeyResponse(resolvedKeyId)
                 if (response == null) {
+                    trace(callingUid, txId, "GeneratedKeyResponse is null. Returning RESPONSE_KEY_NOT_FOUND if deleted, else Continue")
                     if (deletedSoftwareKeys.remove(resolvedKeyId)) return InterceptorUtils.createErrorReply(RESPONSE_KEY_NOT_FOUND)
                     return TransactionResult.Continue
                 }
 
+                trace(callingUid, txId, "Successfully hijacked $txName. Returning simulated KeyEntryResponse.")
                 InterceptorUtils.createTypedObjectReply(response)
 
             } catch (e: Exception) {
-                // [核对点]：吞没一切异常，将畸形数据包默默转交底层原生处理
+                trace(callingUid, txId, "Exception in onPreTransact: ${e.message}")
                 TransactionResult.ContinueAndSkipPost
             }
         }
         return TransactionResult.ContinueAndSkipPost
     }
 
-    override fun onPostTransact(
-        txId: Long, target: IBinder, code: Int, flags: Int, callingUid: Int, callingPid: Int, data: Parcel, reply: Parcel?, resultCode: Int
-    ): TransactionResult {
+    override fun onPostTransact(txId: Long, target: IBinder, code: Int, flags: Int, callingUid: Int, callingPid: Int, data: Parcel, reply: Parcel?, resultCode: Int): TransactionResult {
         if (target != keystoreService || reply == null || InterceptorUtils.hasException(reply)) return TransactionResult.SkipTransaction
 
         if (code == GET_SECURITY_LEVEL_TRANSACTION) {
-            // [核对点]：在结果返回后动态追踪并挂接探针的私有安全会话
             return runCatching {
                 data.enforceInterface(IKeystoreService.DESCRIPTOR)
                 val requestedLevel = data.readInt()
@@ -168,22 +182,14 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 replyCopy.recycle()
 
                 if (returnedBinder != null) {
-                    SystemLogger.info("[TX_ID: $txId] Dynamically intercepting private SecurityLevel session for level $requestedLevel")
-                    // 关键的强转，避免 IBinder 导致的类型推断失败
+                    trace(callingUid, txId, "<== onPostTransact: Hijacking newly created SecurityLevel session (level=$requestedLevel)")
                     val securityLevelInterface = android.system.keystore2.IKeystoreSecurityLevel.Stub.asInterface(returnedBinder)
                     val interceptor = KeyMintSecurityLevelInterceptor(securityLevelInterface, requestedLevel)
                     register(interceptorBackdoor, returnedBinder, interceptor, KeyMintSecurityLevelInterceptor.INTERCEPTED_CODES)
+                } else {
+                    trace(callingUid, txId, "<== onPostTransact: GET_SECURITY_LEVEL returned null binder")
                 }
                 TransactionResult.SkipTransaction
-            }.getOrElse { TransactionResult.SkipTransaction }
-        } else if (code == GET_NUMBER_OF_ENTRIES_TRANSACTION) {
-            return runCatching {
-                val totalCount = reply.readInt() + KeyMintSecurityLevelInterceptor.generatedKeys.keys.count { it.uid == callingUid }
-                TransactionResult.OverrideReply(Parcel.obtain().apply { writeNoException(); writeInt(totalCount) })
-            }.getOrElse { TransactionResult.SkipTransaction }
-        } else if (code == LIST_ENTRIES_TRANSACTION || code == LIST_ENTRIES_BATCHED_TRANSACTION) {
-            return runCatching {
-                InterceptorUtils.createTypedArrayReply(ListEntriesHandler.injectGeneratedKeys(txId, callingUid, reply))
             }.getOrElse { TransactionResult.SkipTransaction }
         } else if (code == GET_KEY_ENTRY_TRANSACTION) {
             try {
@@ -203,10 +209,14 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                     keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
                 }
                 
-                if (keyId == null) return TransactionResult.SkipTransaction
+                if (keyId == null) {
+                    trace(callingUid, txId, "<== onPostTransact: Hardware GET_KEY_ENTRY completed, but KeyId not in our software pool.")
+                    return TransactionResult.SkipTransaction
+                }
 
+                trace(callingUid, txId, "<== onPostTransact: Hardware GET_KEY_ENTRY completed for known KeyId. We are patching the certificate chain now.")
+                
                 val response = reply.readTypedObject(KeyEntryResponse.CREATOR) ?: return TransactionResult.SkipTransaction
-
                 if (userUpdatedKeys.remove(keyId)) return TransactionResult.SkipTransaction
 
                 val parsedParameters = KeyMintAttestation(response.metadata.authorizations?.map { it.keyParameter }?.toTypedArray() ?: emptyArray())
@@ -242,6 +252,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 response.metadata.authorizations = InterceptorUtils.patchAuthorizations(response.metadata.authorizations, callingUid)
                 return InterceptorUtils.createTypedObjectReply(response)
             } catch (e: Exception) {
+                trace(callingUid, txId, "<== onPostTransact Exception: ${e.message}")
                 return TransactionResult.SkipTransaction
             }
         }
@@ -252,19 +263,16 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
         try {
             data.enforceInterface(IKeystoreService.DESCRIPTOR)
             val descriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return TransactionResult.ContinueAndSkipPost
-            
             var generatedKeyInfo: KeyMintSecurityLevelInterceptor.GeneratedKeyInfo? = null
             if (descriptor.domain == Domain.KEY_ID) {
                 for ((k, v) in KeyMintSecurityLevelInterceptor.generatedKeys) {
                     if (v.nspace == descriptor.nspace && k.uid == callingUid) {
-                        generatedKeyInfo = v
-                        break
+                        generatedKeyInfo = v; break
                     }
                 }
             } else if (descriptor.domain == Domain.APP && descriptor.alias != null) {
                 generatedKeyInfo = KeyMintSecurityLevelInterceptor.generatedKeys[KeyIdentifier(callingUid, descriptor.alias!!)]
             }
-
             if (generatedKeyInfo == null) {
                 descriptor.alias?.let { userUpdatedKeys.add(KeyIdentifier(callingUid, it)) }
                 return TransactionResult.ContinueAndSkipPost
@@ -273,8 +281,6 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             generatedKeyInfo.response.metadata.certificateChain = data.createByteArray()
             GeneratedKeyPersistence.rePersistIfNeeded(callingUid, generatedKeyInfo)
             return InterceptorUtils.createSuccessReply(writeResultCode = false)
-        } catch (e: Exception) {
-            return TransactionResult.ContinueAndSkipPost
-        }
+        } catch (e: Exception) { return TransactionResult.ContinueAndSkipPost }
     }
 }
