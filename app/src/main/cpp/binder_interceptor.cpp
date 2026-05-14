@@ -125,23 +125,9 @@ protected:
             info.transaction_id, real_target, info.transaction_code, data, reply, flags, status);
 
         if (!interceptorManagedFlow) {
+            // [核心修复点] 绝对不要调用 setDataPosition(0)！
+            // data 的读取指针此时刚好停在 Interface Token 之后，完美符合 real_target->transact 的预期要求。
             status = real_target->transact(info.transaction_code, data, reply, flags);
-        }
-
-        // [终极核心：物理级全局异常清洗器]
-        // 彻底拦截并清洗因 Kotlin 运行时引发的私有 Binder 异常泄露！
-        if (reply && status == OK && reply->dataSize() >= 4) {
-            const int32_t* data_ptr = reinterpret_cast<const int32_t*>(reply->data());
-            int32_t header = data_ptr[0];
-            // Android AIDL 的正常异常头应为 -8 (EX_SERVICE_SPECIFIC)
-            // 任何其他的负数头（如 -128 运行时异常）都会暴露模拟器身份
-            if (header < 0 && header != -8 && header != -129 /* EX_TRANSACTION_FAILED */) {
-                LOGE("[Sanitizer] Blocked Java exception leak! header: %d", header);
-                reply->setDataPosition(0);
-                reply->writeInt32(-8); // 重写为合法的 ServiceSpecificException
-                reply->writeInt32(-1000); // 注入 KM_ERROR_UNKNOWN_ERROR
-                reply->setDataSize(8); // 物理截断后续的 Java Stack Trace 字符串！
-            }
         }
 
         return status;
@@ -214,7 +200,7 @@ void processBinderReadBuffer(const binder_write_read &bwr) {
         ptr += cmd_size;
     }
 }
-}
+} 
 
 int intercepted_ioctl(int fd, int request, ...) {
     va_list ap;
@@ -334,7 +320,6 @@ bool BinderInterceptor::processInterceptedTransaction(uint64_t tx_id, sp<BBinder
     if (action == intercept::kActionOverrideData) {
         size_t size = pre_resp.readUint64();
         final_request.appendFrom(&pre_resp, pre_resp.dataPosition(), size);
-        final_request.setDataPosition(0);
         result = target->transact(code, final_request, reply, flags);
     } else {
         result = target->transact(code, request, reply, flags);
